@@ -954,9 +954,13 @@ async function chromeInputUpload(params) {
   const objectId = evaluated.result?.objectId;
   if (!objectId) throw new Error("Could not resolve file input object");
   await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-  const requested = await cdp(tab.id, "DOM.requestNode", { objectId });
-  if (!requested.nodeId) throw new Error("Could not resolve file input node");
-  await cdp(tab.id, "DOM.setFileInputFiles", { nodeId: requested.nodeId, files: paths });
+  const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => ({}));
+  const setFileParams = requested.nodeId ? { nodeId: requested.nodeId, files: paths } : { objectId, files: paths };
+  try {
+    await cdp(tab.id, "DOM.setFileInputFiles", setFileParams);
+  } catch (e) {
+    throw new Error("setFileInputFiles failed (nodeId=" + (requested.nodeId || "none") + "): " + (e && e.message ? e.message : String(e)));
+  }
   await cdp(tab.id, "Runtime.callFunctionOn", {
     objectId,
     functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
