@@ -783,6 +783,25 @@ async function chromeInputType(params) {
     await sleep(rng(50, 120));
   }
   const text = String(params.text || "");
+  // Rich contenteditables (Reddit's ProseMirror, Gmail/Facebook composers, etc.)
+  // restructure on each keystroke; per-char CDP keyDown/keyUp events race that
+  // handler and garble or drop characters, and the per-char loop also blows past
+  // the tool timeout for long text. When the focused element is a contenteditable,
+  // commit the whole string in one CDP Input.insertText call (a single
+  // beforeinput(insertText) the editor handles atomically). Plain inputs/textareas
+  // keep the per-char path (real keydown events for apps that depend on them).
+  let useInsertText = false;
+  if (text) {
+    try {
+      const ce = await evaluateInTab({ ...params, expression: "(()=>{const e=document.activeElement;return !!(e&&e.isContentEditable)})()", foreground: false });
+      useInsertText = ce === true;
+    } catch {}
+  }
+  if (useInsertText) {
+    await cdp(tab.id, "Input.insertText", { text });
+    if (params.pressEnter) await chromeInputKey({ ...params, key: "Enter" });
+    return { input: "chrome-insertText", length: text.length };
+  }
   for (const ch of Array.from(text)) await cdpTypeChar(tab.id, ch);
   if (params.pressEnter) {
     await cdpTypeChar(tab.id, "\r").catch(() => undefined);
