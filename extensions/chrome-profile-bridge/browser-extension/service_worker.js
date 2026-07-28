@@ -346,6 +346,25 @@ if (chrome.debugger && chrome.debugger.onDetach) {
   });
 }
 
+// Pending file-chooser intercepts, keyed by tabId. Used by chromeInputUpload
+// when the target is a trigger button (not a persistent <input type=file>):
+// Page.setInterceptFileChooserDialog -> click trigger -> Page.fileChooserOpened
+// -> DOM.setFileInputFiles(backendNodeId). Handles native OS file pickers
+// (e.g. Xiaohongshu image button) that have no persistent DOM file input.
+const pendingFileChoosers = new Map();
+if (chrome.debugger && chrome.debugger.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method !== "Page.fileChooserOpened") return;
+    const tabId = source && source.tabId;
+    const entry = pendingFileChoosers.get(tabId);
+    if (!entry) return;
+    entry.backendNodeId = params && params.backendNodeId;
+    entry.mode = params && params.mode;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.resolve({ backendNodeId: entry.backendNodeId, mode: entry.mode });
+  });
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [tabId, entry] of attachedTabs) {
@@ -940,34 +959,85 @@ async function chromeInputUpload(params) {
   if (!(params.selector || params.uid)) throw new Error("chrome.upload: selector or uid required");
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
   if (!paths.length) throw new Error("chrome.upload: no file paths provided");
+  // Resolve target element. Search main document AND same-origin iframes
+  // (some editors, e.g. Bilibili, live in an iframe with the file input inside).
   const expression = `(() => {
     const selector = ${JSON.stringify(params.selector ?? null)};
     const uid = ${JSON.stringify(params.uid ?? null)};
     const state = window.__PI_CHROME_STATE__;
-    const el = uid && state && state.elements ? state.elements[uid] : (selector ? document.querySelector(selector) : null);
-    if (!el || el.tagName !== "INPUT" || el.type !== "file") throw new Error("Target must be <input type=file>");
+    const findBySel = (sel) => {
+      let el = document.querySelector(sel);
+      if (!el) {
+        for (const f of document.querySelectorAll('iframe')) {
+          try { el = f.contentDocument && f.contentDocument.querySelector(sel); } catch (e) {}
+          if (el) break;
+        }
+      }
+      return el;
+    };
+    const el = uid && state && state.elements ? state.elements[uid] : (selector ? findBySel(selector) : null);
+    if (!el) throw new Error("Could not resolve target element");
     el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
     return el;
   })()`;
   const evaluated = await cdp(tab.id, "Runtime.evaluate", { expression, objectGroup: "pi-chrome-upload", includeCommandLineAPI: false, returnByValue: false });
-  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve file input");
+  if (evaluated.exceptionDetails) throw new Error(evaluated.exceptionDetails.text || "Could not resolve target element");
   const objectId = evaluated.result?.objectId;
-  if (!objectId) throw new Error("Could not resolve file input object");
-  await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
-  const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => ({}));
-  const setFileParams = requested.nodeId ? { nodeId: requested.nodeId, files: paths } : { objectId, files: paths };
-  try {
-    await cdp(tab.id, "DOM.setFileInputFiles", setFileParams);
-  } catch (e) {
-    throw new Error("setFileInputFiles failed (nodeId=" + (requested.nodeId || "none") + "): " + (e && e.message ? e.message : String(e)));
-  }
-  await cdp(tab.id, "Runtime.callFunctionOn", {
+  if (!objectId) throw new Error("Could not resolve target element object");
+  const infoRes = await cdp(tab.id, "Runtime.callFunctionOn", {
     objectId,
-    functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
+    functionDeclaration: `function(){const r=this.getBoundingClientRect();return{tag:this.tagName,type:this.type||'',isFile:this.tagName==='INPUT'&&this.type==='file',cx:Math.round(r.x+r.width/2),cy:Math.round(r.y+r.height/2),w:Math.round(r.width),h:Math.round(r.height)};}`,
     returnByValue: true,
-  }).catch(() => undefined);
-  await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
-  return { input: "chrome", uploaded: paths.map((path) => ({ path })) };
+  });
+  const elInfo = infoRes.result?.value || {};
+  if (elInfo.isFile) {
+    // Persistent <input type=file>: set files directly, no click, no OS picker.
+    await cdp(tab.id, "DOM.enable", {}).catch(() => undefined);
+    const requested = await cdp(tab.id, "DOM.requestNode", { objectId }).catch(() => ({}));
+    const setFileParams = requested.nodeId ? { nodeId: requested.nodeId, files: paths } : { objectId, files: paths };
+    try {
+      await cdp(tab.id, "DOM.setFileInputFiles", setFileParams);
+    } catch (e) {
+      throw new Error("setFileInputFiles failed (nodeId=" + (requested.nodeId || "none") + "): " + (e && e.message ? e.message : String(e)));
+    }
+    await cdp(tab.id, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function() { this.dispatchEvent(new Event("input", { bubbles: true })); this.dispatchEvent(new Event("change", { bubbles: true })); return this.files ? this.files.length : 0; }`,
+      returnByValue: true,
+    }).catch(() => undefined);
+    await cdp(tab.id, "Runtime.releaseObject", { objectId }).catch(() => undefined);
+    return { input: "chrome", mode: "file-input", uploaded: paths.map((path) => ({ path })) };
+  }
+  // Trigger element (button/icon that opens a native file chooser): intercept it.
+  await cdp(tab.id, "Page.enable", {}).catch(() => undefined);
+  try {
+    await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: true });
+  } catch (e) {
+    throw new Error("setInterceptFileChooserDialog failed: " + (e && e.message ? e.message : String(e)));
+  }
+  const chooserPromise = new Promise((resolve, reject) => {
+    const entry = { resolve, reject, backendNodeId: null };
+    pendingFileChoosers.set(tab.id, entry);
+    entry.timer = setTimeout(() => {
+      if (pendingFileChoosers.get(tab.id) === entry) {
+        pendingFileChoosers.delete(tab.id);
+        reject(new Error("file chooser did not open; trigger click may have missed or element is not an upload trigger"));
+      }
+    }, 12000);
+  });
+  try {
+    // Real CDP click at the trigger's center: trusted gesture opens the chooser,
+    // which setInterceptFileChooserDialog intercepts (no OS dialog shown).
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseMoved", x: elInfo.cx, y: elInfo.cy, pointerType: "mouse" });
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mousePressed", x: elInfo.cx, y: elInfo.cy, button: "left", buttons: 1, clickCount: 1, pointerType: "mouse" });
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseReleased", x: elInfo.cx, y: elInfo.cy, button: "left", buttons: 0, clickCount: 1, pointerType: "mouse" });
+    const chooser = await chooserPromise;
+    await cdp(tab.id, "DOM.setFileInputFiles", { backendNodeId: chooser.backendNodeId, files: paths });
+    return { input: "chrome", mode: "file-chooser", uploaded: paths.map((path) => ({ path })) };
+  } finally {
+    pendingFileChoosers.delete(tab.id);
+    await cdp(tab.id, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => undefined);
+  }
 }
 // ===============================================================
 
