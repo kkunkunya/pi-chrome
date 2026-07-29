@@ -1738,7 +1738,27 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 async function takeScreenshot(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+
+  // captureVisibleTab requires activating the target tab. In background mode that
+  // briefly steals the user's Chrome tab even though it restores it afterwards.
+  // CDP can capture a specific tab directly, so use it instead and leave both the
+  // OS window and the user's selected tab untouched.
+  if (!params.foreground) {
+    await attachDebugger(tab.id);
+    const format = params.format || "png";
+    const captured = await cdp(tab.id, "Page.captureScreenshot", {
+      format,
+      quality: format === "jpeg" ? params.quality : undefined,
+      captureBeyondViewport: Boolean(params.fullPage),
+    });
+    if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
+    return {
+      dataUrl: `data:image/${format};base64,${captured.data}`,
+      tab: await formatTab(tab),
+    };
+  }
+
+  await bringToFront(tab);
   let previousActiveId;
   if (!tab.active) {
     const activeBefore = await chrome.tabs.query({ active: true, windowId: tab.windowId });

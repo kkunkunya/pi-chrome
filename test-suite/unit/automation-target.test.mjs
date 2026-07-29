@@ -373,6 +373,34 @@ async function run() {
     ok(state.tabs.has(state.userArticle.id) && state.tabs.has(state.userGmail.id), "fallback: cleanup leaves user tabs intact");
   }
 
+  // ===== Background screenshots use CDP and never activate the automation tab/window. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state);
+    const calls = { tabUpdates: [], windowUpdates: [], cdp: [] };
+    const originalTabUpdate = chrome.tabs.update;
+    chrome.tabs.update = async (id, props = {}) => {
+      calls.tabUpdates.push({ id, props });
+      return originalTabUpdate(id, props);
+    };
+    const originalWindowUpdate = chrome.windows.update;
+    chrome.windows.update = async (id, props = {}) => {
+      calls.windowUpdates.push({ id, props });
+      return originalWindowUpdate(id, props);
+    };
+    chrome.tabs.captureVisibleTab = async () => { throw new Error("background screenshot must not use captureVisibleTab"); };
+    chrome.debugger.sendCommand = (_debuggee, method, _params, callback) => {
+      calls.cdp.push(method);
+      callback(method === "Page.captureScreenshot" ? { data: "unit-image" } : {});
+    };
+    const w = loadWorker(chrome);
+    const result = await w.takeScreenshot({ targetId: String(state.userGmail.id), foreground: false, format: "png", sessionKey: SK });
+    ok(result.dataUrl === "data:image/png;base64,unit-image", "background screenshot: returns CDP image data");
+    ok(calls.cdp.includes("Page.captureScreenshot"), "background screenshot: captures through CDP");
+    ok(calls.tabUpdates.length === 0, "background screenshot: does not activate or restore any tab");
+    ok(calls.windowUpdates.length === 0, "background screenshot: does not focus any window");
+  }
+
   // ===== Robust cleanup: no-op when nothing created, and when target already closed manually. =====
   {
     const state = makeChromeState();
