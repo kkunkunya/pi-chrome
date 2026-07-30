@@ -673,7 +673,18 @@ export default function (pi: ExtensionAPI): void {
 		[PI_CHROME_AUTH_KEY]?: { until: number | "indefinite" };
 	};
 	const alreadyLoaded = globalState[PI_CHROME_GLOBAL_KEY];
-	if (alreadyLoaded?.token || (alreadyLoaded && alreadyLoaded.root !== currentRoot)) {
+	// Only block a *different* extension root (two installed copies). A same-root
+	// re-entry is legitimate: subagent sessions (pi-subagents) load extensions into
+	// their own ExtensionRunner, so this factory runs once per session. Blocking it
+	// here would leave the subagent with an empty pi-chrome tools map and no
+	// before_agent_start primer — i.e. chrome_* unusable in subagents.
+	//
+	// The bridge itself already supports coexistence: ChromeProfileBridge.start()
+	// is idempotent per instance and falls back to client mode on EADDRINUSE, so a
+	// secondary session gets its own bridge (client of the owner's server) and
+	// forwards commands to the same Chrome connector. /reload is still safe: the
+	// owner's session_shutdown clears this flag (gated on server mode below).
+	if (alreadyLoaded && alreadyLoaded.root !== currentRoot) {
 		console.warn(
 			`pi-chrome already loaded from ${alreadyLoaded.root} (v${alreadyLoaded.version}); skipping duplicate from ${currentRoot}.`,
 		);
@@ -936,8 +947,13 @@ export default function (pi: ExtensionAPI): void {
 		// that only ever leaves a clearly pi-chrome window for the user to close — never a user
 		// tab — and /chrome revoke remains the reliable, bridge-alive cleanup path.)
 		if (event?.reason !== "reload") cleanupAutomationTargetBestEffort();
+		// Capture server ownership BEFORE stop(): stop() resets mode to undefined,
+		// and only the server-owning session may clear the global singleton flag.
+		// Client-mode sessions (subagents reusing the owner's bridge via the
+		// EADDRINUSE fallback) must not delete the flag the owner still relies on.
+		const wasServer = bridge.status().mode === "server";
 		bridge.stop();
-		if (globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
+		if (wasServer && globalState[PI_CHROME_GLOBAL_KEY]?.token === instanceToken) {
 			delete globalState[PI_CHROME_GLOBAL_KEY];
 		}
 	});
