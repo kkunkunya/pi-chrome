@@ -333,6 +333,33 @@ class ChromeProfileBridge {
 		};
 	}
 
+	// A client-mode Pi session has no local poll timestamp: the process that owns
+	// the loopback server receives extension polls. Ask that owner for display
+	// status so chrome_launch does not falsely say "waiting for extension" while
+	// forwarded chrome_* commands already work.
+	async connectionStatus(): Promise<Record<string, unknown>> {
+		const local = this.status();
+		if (this.mode !== "client") return local;
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), 1_000);
+		try {
+			const response = await fetch(`${this.url}/status`, { signal: controller.signal });
+			if (!response.ok) return local;
+			const owner = (await response.json()) as Record<string, unknown>;
+			return {
+				...local,
+				connected: owner.connected === true,
+				lastSeenAt: typeof owner.lastSeenAt === "number" ? owner.lastSeenAt : local.lastSeenAt,
+				clientName: typeof owner.clientName === "string" ? owner.clientName : local.clientName,
+				ownerMode: owner.mode,
+			};
+		} catch {
+			return local;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
 	async start(): Promise<void> {
 		if (this.server || this.mode === "client") return;
 		await this.bindServerOrClient();
@@ -1316,9 +1343,10 @@ Usage rules:
 			headless: Type.Optional(Type.Boolean({ description: "Ignored." })),
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
-			if (params.url && bridge.connected) {
+			const status = await bridge.connectionStatus();
+			if (params.url && status.connected === true) {
 				const result = await authorizedBridgeSend("tab.new", { url: params.url }, DEFAULT_TIMEOUT_MS, signal);
-				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status: bridge.status(), result } };
+				return { content: [{ type: "text", text: `Chrome bridge connected; opened ${params.url}` }], details: { status, result } };
 			}
 			return {
 				content: [
@@ -1331,10 +1359,10 @@ Usage rules:
 							`2. Enable Developer mode.\n` +
 							`3. Click “Load unpacked”.\n` +
 							`4. Select: ${browserExtensionPath()}\n\n` +
-							`Status: ${bridge.connected ? "connected" : "waiting for extension"}.`,
+							`Status: ${status.connected === true ? "connected" : "waiting for extension"}.`,
 					},
 				],
-				details: { status: bridge.status(), extensionPath: browserExtensionPath() },
+				details: { status, extensionPath: browserExtensionPath() },
 			};
 		},
 	});
