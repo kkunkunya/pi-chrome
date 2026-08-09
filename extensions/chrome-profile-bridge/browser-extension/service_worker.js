@@ -371,8 +371,17 @@ async function probePanelTarget(target) {
   try {
     await attachPanel(target);
     const res = await cdpEvalOn(debuggee, "({ title: document.title || '', topLevel: window.self === window.top, textLen: (document.body ? document.body.innerText : '').length, width: window.innerWidth, height: window.innerHeight })");
-    if (res.exceptionDetails) return {};
-    return res && res.result ? res.result.value : {};
+    const out = {};
+    if (res.exceptionDetails) return out;
+    Object.assign(out, res && res.result ? res.result.value : {});
+    // Remote-hosted side panels (e.g. AITDK) render as OOPIF targets parented to the
+    // host tab; the panel the user currently sees is the one whose parent is the
+    // active tab. Record the parent so panel.list can rank instances.
+    try {
+      const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
+      if (ti && ti.targetInfo && ti.targetInfo.parentId) out.parentId = ti.targetInfo.parentId;
+    } catch {}
+    return out;
   } catch (e) {
     return { attachError: String(e.message || e).slice(0, 300) };
   } finally {
@@ -1349,17 +1358,23 @@ async function dispatch(action, params) {
     }
     case "panel.list": {
       // Enumerate non-tab http(s) CDP targets (open side panels) and probe each for
-      // title / top-level-ness / text size. attachError marks panels Chrome blocks
-      // (chrome-extension:// pages of other extensions).
+      // title / top-level-ness / text size / parent. attachError marks panels Chrome
+      // blocks (chrome-extension:// pages of other extensions).
       // Panel heuristic: a remote-hosted side panel (e.g. AITDK at
       // https://extension.aitdk.com/) is rendered by Chrome as an OOPIF target parented
-      // to the active tab — window.self===window.top is then false, so topLevel alone
-      // would filter the real panel out. Accept topLevel targets OR content-rich ones
+      // to a tab — window.self===window.top is then false, so topLevel alone would
+      // filter the real panel out. Accept topLevel targets OR content-rich ones
       // (textLen > 300) that attach cleanly; bare third-party iframes (stripe, youtube
-      // embeds) stay filtered out. Dedupe by URL, keeping the most complete probe.
+      // embeds) stay filtered out. Side panels keep one instance per previously-visited
+      // tab; the one the user currently sees is parented to the active tab, so dedupe
+      // by URL and mark that instance `current`.
       const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
       const panels = [];
       const seenByUrl = new Map();
+      const activeTab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
+      const activeTabTargetId = activeTab && typeof activeTab.id === "number"
+        ? (targets.find((t) => t.tabId === activeTab.id) || {}).id
+        : undefined;
       for (const t of targets) {
         const url = String(t.url || "");
         if (t.tabId !== undefined && t.tabId !== null) continue;
@@ -1367,9 +1382,12 @@ async function dispatch(action, params) {
         const probe = await probePanelTarget(t);
         if (!probe || probe.attachError) continue;
         if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300)) continue;
+        const entry = { id: t.id, type: t.type, url, current: false, ...probe };
+        if (activeTabTargetId && probe.parentId === activeTabTargetId) entry.current = true;
         const prev = seenByUrl.get(url);
-        if (prev && (prev.textLen || 0) >= (probe.textLen || 0)) continue;
-        seenByUrl.set(url, { id: t.id, type: t.type, url, ...probe });
+        if (prev && !entry.current && (prev.textLen || 0) >= (entry.textLen || 0)) continue;
+        if (prev && entry.current && prev.current) continue;
+        seenByUrl.set(url, entry);
       }
       return Array.from(seenByUrl.values());
     }
@@ -1962,6 +1980,40 @@ async function takeScreenshot(params) {
       });
       if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
       return { dataUrl: `data:image/${format};base64,${captured.data}`, panel: { id: target.id, url: target.url, title: target.title || "" } };
+    } catch (error) {
+      // Chrome 150+ renders remote-hosted side panels as OOPIF targets, where
+      // Page.captureScreenshot is rejected ("only on top-level targets"). Fall back
+      // to capturing the host tab: for a window with an open side panel the tab
+      // capture includes the panel region.
+      if (!/top-level targets/i.test(String(error?.message || error))) throw error;
+      let hostTabId;
+      try {
+        const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
+        const parentId = ti && ti.targetInfo && ti.targetInfo.parentId;
+        if (parentId) {
+          const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+          const parent = targets.find((t) => t.id === parentId);
+          if (parent && typeof parent.tabId === "number") hostTabId = parent.tabId;
+        }
+      } catch {}
+      if (typeof hostTabId !== "number") {
+        throw new Error(`Panel is an OOPIF side panel and its host tab could not be resolved: ${error?.message || error}`);
+      }
+      await chrome.debugger.detach(debuggee).catch(() => {});
+      const hostTab = await chrome.tabs.get(hostTabId).catch(() => null);
+      if (!hostTab) throw new Error(`Panel host tab ${hostTabId} is gone`);
+      if (params.foreground) await bringToFront(hostTab);
+      await attachDebugger(hostTabId);
+      const format = params.format || "png";
+      const captured = await cdp(hostTabId, "Page.captureScreenshot", {
+        format,
+        quality: format === "jpeg" ? params.quality : undefined,
+      });
+      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
+      return {
+        dataUrl: `data:image/${format};base64,${captured.data}`,
+        panel: { id: target.id, url: target.url, title: target.title || "", oopifHostTabId: hostTabId },
+      };
     } finally {
       try { await chrome.debugger.detach(debuggee); } catch {}
     }

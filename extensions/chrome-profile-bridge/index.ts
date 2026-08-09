@@ -1564,6 +1564,7 @@ Usage rules:
 				textLen?: number;
 				width?: number;
 				height?: number;
+				current?: boolean;
 				attachError?: string;
 			}>;
 			const text =
@@ -1572,7 +1573,7 @@ Usage rules:
 					: (panels || [])
 							.map(
 								(p) =>
-									`${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}`,
+									`${p.current ? "[current] " : ""}${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}${p.current ? " (this session's active tab)" : ""}`,
 							)
 							.join("\n");
 			return { content: [{ type: "text", text }], details: { panels: panels as Json } };
