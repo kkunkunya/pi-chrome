@@ -1285,7 +1285,29 @@ async function dispatch(action, params) {
       };
     case "tab.list": {
       const tabs = await chrome.tabs.query({});
-      return Promise.all(tabs.map(formatTab));
+      let list = tabs;
+      if (params.sessionOnly) {
+        // sessionOnly: only tabs in the group named by groupTitle (default "Pi")
+        // — the calling Pi session's own task group.
+        const wanted = cleanGroupTitle(params.groupTitle || "Pi").toLowerCase();
+        const groups = await chrome.tabGroups.query({}).catch(() => []);
+        const ids = new Set(groups.filter((g) => (g.title || "").trim().toLowerCase() === wanted).map((g) => g.id));
+        list = tabs.filter((t) => typeof t.groupId === "number" && ids.has(t.groupId));
+      }
+      return Promise.all(list.map(formatTab));
+    }
+    case "tab.closeGroup": {
+      // One-shot cleanup for a task's tab group: close every tab whose group title
+      // matches groupTitle (default "Pi"). Never touches tabs outside that group.
+      const wanted = cleanGroupTitle(params.groupTitle || "Pi").toLowerCase();
+      const groups = await chrome.tabGroups.query({}).catch(() => []);
+      const ids = new Set(groups.filter((g) => (g.title || "").trim().toLowerCase() === wanted).map((g) => g.id));
+      if (ids.size === 0) return { closed: 0, groupTitle: wanted };
+      const tabs = await chrome.tabs.query({});
+      const toClose = tabs.filter((t) => typeof t.groupId === "number" && ids.has(t.groupId)).map((t) => t.id);
+      if (toClose.length === 0) return { closed: 0, groupTitle: wanted };
+      await chrome.tabs.remove(toClose);
+      return { closed: toClose.length, groupTitle: wanted };
     }
     case "tab.new": {
       // Every Pi-opened tab must join a tab group. There is intentionally no opt-out: an ungrouped

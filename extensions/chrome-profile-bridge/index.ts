@@ -662,7 +662,7 @@ class ChromeProfileBridge {
 	}
 }
 
-const tabActionValues = ["list", "new", "activate", "close", "group", "ungroup", "version"] as const;
+const tabActionValues = ["list", "new", "activate", "close", "closeGroup", "group", "ungroup", "version"] as const;
 const imageFormatValues = ["png", "jpeg"] as const;
 const waitForValues = ["selector", "expression"] as const;
 const CHROME_TOOL_NAMES = [
@@ -1374,7 +1374,8 @@ Usage rules:
 	pi.registerTool({
 		name: "chrome_tab",
 		label: "Chrome Tab",
-		description: "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab.",
+		description:
+			"List, create, activate, close, close a whole task group, group, ungroup, or inspect tabs in the user's existing Chrome profile via the companion extension. New/grouped tabs always use this session's Pi tab group. activate/close/group/ungroup require a target (targetId/urlIncludes/titleIncludes); with no target they act on this session's pi-chrome automation tab if one exists, and otherwise error rather than touching the user's active tab. action=closeGroup closes every tab in this session's tab group (one-shot task cleanup); action=list with sessionOnly=true lists only this session's own group's tabs.",
 		promptSnippet: "List/open/activate/close/group existing Chrome tabs through the companion extension.",
 		parameters: Type.Object({
 			action: StringEnum(tabActionValues),
@@ -1383,7 +1384,8 @@ Usage rules:
 			urlIncludes: Type.Optional(Type.String({ description: "Match the target tab by URL substring for activate/close/group/ungroup." })),
 			titleIncludes: Type.Optional(Type.String({ description: "Match the target tab by title substring for activate/close/group/ungroup." })),
 			group: Type.Optional(Type.Boolean({ description: "Deprecated; ignored. Pi-created tabs always join this session's own tab group." })),
-			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>')." })),
+			groupTitle: Type.Optional(Type.String({ description: "Deprecated for action=new/group; ignored so one Pi session uses one tab group ('Pi Session: <name-or-id>'). For action=closeGroup / list+sessionOnly it is likewise overridden with this session's group title." })),
+			sessionOnly: Type.Optional(Type.Boolean({ description: "For action=list: only list tabs in this session's own tab group (cheap preview of what closeGroup would close)." })),
 			groupColor: Type.Optional(Type.String({ description: "Tab group color for action=group/new: grey, blue, red, yellow, green, pink, purple, cyan, or orange. Defaults to blue." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
@@ -1393,7 +1395,7 @@ Usage rules:
 			// Force every Pi-opened/explicitly-grouped tab into this session's own group,
 			// named after the session display name (falling back to the session id). There is
 			// intentionally no opt-out: one Pi session should create/use one tab group.
-			if (params.action === "new" || params.action === "group") {
+			if (params.action === "new" || params.action === "group" || params.action === "closeGroup" || (params.action === "list" && params.sessionOnly)) {
 				forwarded.groupTitle = sessionGroupTitle(ctx);
 			}
 			const result = await authorizedBridgeSend(`tab.${params.action}`, forwarded, DEFAULT_TIMEOUT_MS, signal);
@@ -1940,7 +1942,7 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-pdfs", `${new Date().toISOString().replace(/[:.]/g, "-")}.pdf`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			const result = (await authorizedBridgeSend("page.pdf", withBackground(params), params.landscape ? 60_000 : DEFAULT_TIMEOUT_MS, signal)) as {
+			const result = (await authorizedBridgeSend("page.pdf", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as {
 				dataBase64?: string;
 				tab?: unknown;
 				panel?: unknown;

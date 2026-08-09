@@ -81,7 +81,7 @@ function makeChrome(state, { withWindows = true, withStorage = true, withTabGrou
         return { ...tab };
       },
       update: async (id, props = {}) => { const t = tabs.get(id); if (!t) throw new Error(`No tab with id ${id}`); Object.assign(t, props); return { ...t }; },
-      remove: async (id) => { tabs.delete(id); },
+      remove: async (id) => { for (const tid of Array.isArray(id) ? id : [id]) tabs.delete(tid); },
       group: async ({ groupId, tabIds = [] } = {}) => {
         let gid = groupId;
         if (typeof gid !== "number") {
@@ -414,6 +414,36 @@ async function run() {
     for (const [tid, tab] of [...state.tabs]) if (tab.windowId === t.windowId) state.tabs.delete(tid);
     const stale = await w.cleanupAutomationTarget(SK);
     ok(stale.closedWindowId === null && stale.closedTabId === null, "cleanup: robust when owned window was already closed");
+  }
+
+  // ===== tab.closeGroup + tab.list sessionOnly: one-shot task-group cleanup. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupTitle = "Pi Session: research";
+
+    // Create a task group with three tabs via tab.new (which groups by title).
+    for (let i = 0; i < 3; i++) {
+      await w.dispatch("tab.new", { url: `https://pi.test/page-${i}`, groupTitle, sessionKey: SK });
+    }
+    // A second, unrelated group (another task) plus the pre-seeded user tabs.
+    await w.dispatch("tab.new", { url: "https://pi.test/other-task", groupTitle: "Pi Session: other", sessionKey: SK });
+
+    // tab.list sessionOnly: only the named group's tabs.
+    const only = await w.dispatch("tab.list", { sessionOnly: true, groupTitle, sessionKey: SK });
+    ok(Array.isArray(only) && only.length === 3, `tab.list sessionOnly: returns only the task group's tabs (got ${only?.length})`);
+    ok(only.every((t) => t.url.startsWith("https://pi.test/page-")), "tab.list sessionOnly: no tabs from other groups");
+
+    // tab.closeGroup: closes the named group, leaves user tabs + other groups alone.
+    const closed = await w.dispatch("tab.closeGroup", { groupTitle, sessionKey: SK });
+    ok(closed.closed === 3, `tab.closeGroup: closed exactly the 3 group tabs (got ${closed.closed})`);
+    const remaining = await w.dispatch("tab.list", { sessionKey: SK });
+    ok(remaining.length === 3, `tab.closeGroup: other-group tab + 2 user tabs survive (got ${remaining.length}: ${remaining.map((t) => t.url).join(",")})`);
+    ok(!remaining.some((t) => String(t.url).startsWith("https://pi.test/page-")), "tab.closeGroup: task group tabs are gone");
+
+    // closeGroup on a missing group: no-op, closed: 0.
+    const missing = await w.dispatch("tab.closeGroup", { groupTitle: "Pi Session: nope", sessionKey: SK });
+    ok(missing.closed === 0, "tab.closeGroup: no-op for unknown group title");
   }
 
   console.log(`\n${passes} passed, ${failures} failed`);
