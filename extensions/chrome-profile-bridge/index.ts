@@ -681,6 +681,8 @@ const CHROME_TOOL_NAMES = [
 	"chrome_list_network_requests",
 	"chrome_get_network_request",
 	"chrome_screenshot",
+	"chrome_cdp",
+	"chrome_pdf",
 	"chrome_hover",
 	"chrome_drag",
 	"chrome_tap",
@@ -1884,6 +1886,69 @@ Usage rules:
 			const base64 = result.dataUrl.replace(/^data:image\/(?:png|jpeg);base64,/, "");
 			await writeFile(outputPath, Buffer.from(base64, "base64"));
 			return { content: [{ type: "text", text: `Saved Chrome screenshot to ${outputPath}` }], details: { path: outputPath, format, tab: result.tab } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_cdp",
+		label: "Chrome CDP",
+		description:
+			"Send a raw Chrome DevTools Protocol command to an existing Chrome tab (or an open side panel when panelId/panelUrl is given) and return the raw response. Escape hatch for capabilities the higher-level tools don't cover — e.g. Page.getLayoutMetrics, DOM.enable, Network.enable. Advanced; prefer the dedicated tools when they fit.",
+		promptSnippet: "Send a raw CDP command to a Chrome tab.",
+		parameters: Type.Object({
+			method: Type.String({ description: "CDP method, e.g. Page.getLayoutMetrics, DOM.enable, Network.enable." }),
+			params: Type.Optional(Type.Any({ description: "CDP method params (object)." })),
+			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); sends the command in the panel context instead of a tab." })),
+			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(Type.Boolean()),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const result = await authorizedBridgeSend("page.cdp", withBackground(params), DEFAULT_TIMEOUT_MS, signal);
+			return { content: [{ type: "text", text: truncateText(safeJson(result)) }], details: { result: result as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_pdf",
+		label: "Chrome Save as PDF",
+		description:
+			"Render the current page to a PDF file via CDP and save it to disk — like \"Save as PDF\" in the print dialog. Returns the output file path. Optionally pick paper format, landscape, scale, and whether backgrounds print.",
+		promptSnippet: "Save the current page as a PDF file.",
+		parameters: Type.Object({
+			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-pdfs/<timestamp>.pdf." })),
+			paperFormat: Type.Optional(StringEnum(["letter", "legal", "tabloid", "a4", "a3", "a5"])),
+			landscape: Type.Optional(Type.Boolean()),
+			scale: Type.Optional(Type.Number({ description: "Scale 0.1-2.0 (default 1)." })),
+			printBackground: Type.Optional(Type.Boolean({ default: true })),
+			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); renders the panel instead of a tab." })),
+			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels)." })),
+			targetId: Type.Optional(Type.String()),
+			urlIncludes: Type.Optional(Type.String()),
+			titleIncludes: Type.Optional(Type.String()),
+			background: Type.Optional(
+				Type.Boolean({ description: "If true (the default), render silently without focusing Chrome; pass false to focus Chrome so the user can watch." }),
+			),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-pdfs", `${new Date().toISOString().replace(/[:.]/g, "-")}.pdf`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = (await authorizedBridgeSend("page.pdf", withBackground(params), params.landscape ? 60_000 : DEFAULT_TIMEOUT_MS, signal)) as {
+				dataBase64?: string;
+				tab?: unknown;
+				panel?: unknown;
+			};
+			if (!result?.dataBase64) throw new Error("PDF render returned no data");
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, Buffer.from(result.dataBase64, "base64"));
+			return { content: [{ type: "text", text: `Saved PDF to ${outputPath}` }], details: { path: outputPath, tab: result.tab, panel: result.panel } };
 		},
 	});
 

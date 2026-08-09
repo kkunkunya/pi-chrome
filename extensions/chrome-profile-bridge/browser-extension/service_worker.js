@@ -1419,6 +1419,12 @@ async function dispatch(action, params) {
       }
       return await formatTab(await chrome.tabs.get(updated.id));
     }
+    case "page.cdp":
+      // Raw CDP passthrough (WebBridge-style escape hatch): any chrome.debugger
+      // method/params on the target tab's session, or on a side panel debuggee.
+      return cdpPassthrough(params);
+    case "page.pdf":
+      return renderPdf(params);
     case "page.screenshot":
       return takeScreenshot(params);
     case "automation.status": {
@@ -1838,6 +1844,74 @@ function waitForTabComplete(tabId, timeoutMs) {
     };
     chrome.tabs.onUpdated.addListener(listener);
   });
+}
+
+// Raw CDP passthrough (chrome_cdp). Escape hatch for cases the higher-level tools
+// don't cover: any chrome.debugger method/params on the target tab's session, or on
+// a side panel debuggee when panelId/panelUrl is given. Method must be a CDP method
+// name; params is the raw method params object (optional).
+async function cdpPassthrough(params) {
+  const method = params.method;
+  if (!method || typeof method !== "string" || !/^[A-Z][A-Za-z0-9]*(\.[a-zA-Z][A-Za-z0-9]*)+$/.test(method)) {
+    throw new Error(`page.cdp requires a CDP method like "Page.getLayoutMetrics" or "Runtime.evaluate", got ${JSON.stringify(method)}`);
+  }
+  const cdpParams = params.params && typeof params.params === "object" ? params.params : {};
+  if (params.panelId || params.panelUrl) {
+    const target = await findPanelTarget(params);
+    if (!target) {
+      throw new Error(
+        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
+        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
+      );
+    }
+    const debuggee = await attachPanel(target);
+    try {
+      return await cdpRawOn(debuggee, method, cdpParams);
+    } finally {
+      try { await chrome.debugger.detach(debuggee); } catch {}
+    }
+  }
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  return await cdpRaw(tab.id, method, cdpParams);
+}
+
+// Render the current page to PDF via CDP Page.printToPDF (chrome_pdf), like "Save
+// as PDF" in the print dialog. Returns base64 PDF data; the Pi side writes it to disk.
+async function renderPdf(params) {
+  if (params.panelId || params.panelUrl) {
+    const target = await findPanelTarget(params);
+    if (!target) {
+      throw new Error(
+        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
+        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
+      );
+    }
+    const debuggee = await attachPanel(target);
+    try {
+      const pdf = await cdpRawOn(debuggee, "Page.printToPDF", pdfParams(params));
+      if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
+      return { dataBase64: pdf.data, panel: { id: target.id, url: target.url, title: target.title || "" } };
+    } finally {
+      try { await chrome.debugger.detach(debuggee); } catch {}
+    }
+  }
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  const pdf = await cdpRaw(tab.id, "Page.printToPDF", pdfParams(params));
+  if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
+  return { dataBase64: pdf.data, tab: await formatTab(tab) };
+}
+
+function pdfParams(params) {
+  return {
+    paperFormat: params.paperFormat || "letter",
+    landscape: params.landscape === true,
+    scale: typeof params.scale === "number" ? Math.min(Math.max(params.scale, 0.1), 2) : 1,
+    printBackground: params.printBackground !== false,
+    preferCSSPageSize: false,
+    generateTaggedPDF: false,
+  };
 }
 
 async function takeScreenshot(params) {
