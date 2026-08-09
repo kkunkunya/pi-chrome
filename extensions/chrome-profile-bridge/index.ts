@@ -1558,14 +1558,20 @@ Usage rules:
 		name: "chrome_panels",
 		label: "Chrome Panels",
 		description:
-			"List open browser side panels. Extension side panels (e.g. AITDK) are not tabs — they are non-tab CDP targets the bridge can attach to when hosted at an http(s) URL. Returns each panel's id, url, title, and text length; panels Chrome blocks (chrome-extension:// pages of other extensions) are omitted. Pass the id to chrome_evaluate / chrome_screenshot via panelId (or panelUrl substring).",
+			"List open browser side panels. Extension side panels (e.g. AITDK) are non-tab CDP targets. Defaults to one representative per panel URL; includeAllInstances=true exposes every per-tab instance with its hostTab, and sessionOnly=true limits hosts to this Pi session's tab group. http(s)-hosted panels are readable; chrome-extension:// panels of other extensions are omitted. Pass a panel id to chrome_panel_extract / chrome_evaluate / chrome_screenshot.",
 		promptSnippet: "List open Chrome extension side panels.",
 		parameters: Type.Object({
+			includeAllInstances: Type.Optional(Type.Boolean({ description: "Return every per-tab panel instance instead of deduplicating by panel URL." })),
+			sessionOnly: Type.Optional(Type.Boolean({ description: "Return only instances hosted by tabs in this Pi session's tab group. Implies host-tab mapping." })),
+			urlIncludes: Type.Optional(Type.String({ description: "Only panels whose own URL contains this substring." })),
 			host: Type.Optional(Type.String()),
 			port: Type.Optional(Type.Number()),
 		}),
-		async execute(_id, params, signal): Promise<ToolTextResult> {
-			const panels = (await authorizedBridgeSend("panel.list", params, DEFAULT_TIMEOUT_MS, signal)) as Array<{
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
+			const forwarded = params.sessionOnly
+				? { ...params, includeAllInstances: true, groupTitle: sessionGroupTitle(ctx) }
+				: params;
+			const panels = (await authorizedBridgeSend("panel.list", forwarded, DEFAULT_TIMEOUT_MS, signal)) as Array<{
 				id: string;
 				url: string;
 				title?: string;
@@ -1575,6 +1581,7 @@ Usage rules:
 				height?: number;
 				current?: boolean;
 				attachError?: string;
+				hostTab?: { id?: number; title?: string; url?: string; group?: { title?: string } | null } | null;
 			}>;
 			const text =
 				(panels || []).length === 0
@@ -1582,7 +1589,7 @@ Usage rules:
 					: (panels || [])
 							.map(
 								(p) =>
-									`${p.current ? "[current] " : ""}${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}${p.current ? " (this session's active tab)" : ""}`,
+									`${p.current ? "[current] " : ""}${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}${p.hostTab ? `\n  hostTab ${p.hostTab.id}: ${p.hostTab.title || "(untitled)"} — ${p.hostTab.url || ""}${p.hostTab.group?.title ? ` [${p.hostTab.group.title}]` : ""}` : ""}${p.current ? " (active host tab)" : ""}`,
 							)
 							.join("\n");
 			return { content: [{ type: "text", text }], details: { panels: panels as Json } };

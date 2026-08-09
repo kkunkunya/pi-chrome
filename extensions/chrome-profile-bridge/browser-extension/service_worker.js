@@ -1443,30 +1443,57 @@ async function dispatch(action, params) {
       // filter the real panel out. Accept topLevel targets OR content-rich ones
       // (textLen > 300) that attach cleanly; bare third-party iframes (stripe, youtube
       // embeds) stay filtered out. Side panels keep one instance per previously-visited
-      // tab; the one the user currently sees is parented to the active tab, so dedupe
-      // by URL and mark that instance `current`.
+      // tab; the one the user currently sees is parented to the active tab. Default
+      // behavior dedupes by URL; includeAllInstances exposes every instance with its
+      // host tab so callers can extract a whole Pi session without relying on focus.
       const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+      const targetById = new Map(targets.map((target) => [target.id, target]));
+      const tabs = await chrome.tabs.query({}).catch(() => []);
+      const tabById = new Map(tabs.filter((tab) => typeof tab.id === "number").map((tab) => [tab.id, tab]));
       const panels = [];
       const seenByUrl = new Map();
       const activeTab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
       const activeTabTargetId = activeTab && typeof activeTab.id === "number"
         ? (targets.find((t) => t.tabId === activeTab.id) || {}).id
         : undefined;
+      let sessionGroupIds;
+      if (params.sessionOnly) {
+        const wanted = cleanGroupTitle(params.groupTitle || "Pi").toLowerCase();
+        const groups = await chrome.tabGroups.query({}).catch(() => []);
+        sessionGroupIds = new Set(groups.filter((group) => (group.title || "").trim().toLowerCase() === wanted).map((group) => group.id));
+      }
       for (const t of targets) {
         const url = String(t.url || "");
         if (t.tabId !== undefined && t.tabId !== null) continue;
         if (!/^https?:/i.test(url)) continue;
+        if (params.urlIncludes && !url.includes(String(params.urlIncludes))) continue;
         const probe = await probePanelTarget(t);
         if (!probe || probe.attachError) continue;
-        if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300)) continue;
-        const entry = { id: t.id, type: t.type, url, current: false, ...probe };
-        if (activeTabTargetId && probe.parentId === activeTabTargetId) entry.current = true;
+        const parentTarget = probe.parentId ? targetById.get(probe.parentId) : null;
+        const hostTab = parentTarget && typeof parentTarget.tabId === "number" ? tabById.get(parentTarget.tabId) : null;
+        // Explicit all-instance discovery with a panel URL filter is stronger evidence
+        // than the text-size heuristic: a real panel can temporarily render <300 chars
+        // while loading. Keep the heuristic for broad/default listing so arbitrary
+        // content-rich page iframes do not flood chrome_panels.
+        const explicitHostedInstance = Boolean(params.includeAllInstances && params.urlIncludes && hostTab);
+        if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300) && !explicitHostedInstance) continue;
+        if (sessionGroupIds && (!hostTab || !sessionGroupIds.has(hostTab.groupId))) continue;
+        const entry = {
+          id: t.id,
+          type: t.type,
+          url,
+          current: Boolean(activeTabTargetId && probe.parentId === activeTabTargetId),
+          ...probe,
+          hostTab: hostTab ? await formatTab(hostTab) : null,
+        };
+        panels.push(entry);
+        if (params.includeAllInstances) continue;
         const prev = seenByUrl.get(url);
-        if (prev && !entry.current && (prev.textLen || 0) >= (entry.textLen || 0)) continue;
-        if (prev && entry.current && prev.current) continue;
+        if (prev?.current && !entry.current) continue;
+        if (prev && prev.current === entry.current && (prev.textLen || 0) >= (entry.textLen || 0)) continue;
         seenByUrl.set(url, entry);
       }
-      return Array.from(seenByUrl.values());
+      return params.includeAllInstances ? panels : Array.from(seenByUrl.values());
     }
     case "panel.readText":
       return readPanelText(params);
