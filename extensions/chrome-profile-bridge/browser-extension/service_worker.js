@@ -299,7 +299,7 @@ async function attachDebugger(tabId) {
 }
 
 async function describeInputTarget(tabId) {
-  const tab = await chrome.tabs.get(Number(tabId)).catch(() => null);
+  const tab = Number.isFinite(Number(tabId)) ? await chrome.tabs.get(Number(tabId)).catch(() => null) : null;
   const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
   let targets = [];
   try { targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))); } catch {}
@@ -316,7 +316,7 @@ function targetMetaSuffix(meta) {
 }
 
 async function inputDebug(params) {
-  const requested = params?.targetId ? await describeInputTarget(Number(params.targetId)) : await describeInputTarget(-1);
+  const requested = params?.targetId ? await describeInputTarget(Number(params.targetId)) : await describeInputTarget(undefined);
   return {
     extensionVersion: chrome.runtime.getManifest().version,
     extensionId: chrome.runtime.id,
@@ -1351,19 +1351,27 @@ async function dispatch(action, params) {
       // Enumerate non-tab http(s) CDP targets (open side panels) and probe each for
       // title / top-level-ness / text size. attachError marks panels Chrome blocks
       // (chrome-extension:// pages of other extensions).
+      // Panel heuristic: a remote-hosted side panel (e.g. AITDK at
+      // https://extension.aitdk.com/) is rendered by Chrome as an OOPIF target parented
+      // to the active tab — window.self===window.top is then false, so topLevel alone
+      // would filter the real panel out. Accept topLevel targets OR content-rich ones
+      // (textLen > 300) that attach cleanly; bare third-party iframes (stripe, youtube
+      // embeds) stay filtered out. Dedupe by URL, keeping the most complete probe.
       const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
       const panels = [];
+      const seenByUrl = new Map();
       for (const t of targets) {
         const url = String(t.url || "");
         if (t.tabId !== undefined && t.tabId !== null) continue;
         if (!/^https?:/i.test(url)) continue;
         const probe = await probePanelTarget(t);
-        // Only top-level pages are side panels; workers and embedded iframes (which
-        // probe as topLevel:false or empty) are filtered out.
-        if (!probe || probe.topLevel !== true) continue;
-        panels.push({ id: t.id, type: t.type, url, ...probe });
+        if (!probe || probe.attachError) continue;
+        if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300)) continue;
+        const prev = seenByUrl.get(url);
+        if (prev && (prev.textLen || 0) >= (probe.textLen || 0)) continue;
+        seenByUrl.set(url, { id: t.id, type: t.type, url, ...probe });
       }
-      return panels;
+      return Array.from(seenByUrl.values());
     }
     case "page.snapshot":
       return snapshotInTab(params);

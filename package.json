@@ -1,6 +1,6 @@
 {
 	"name": "pi-chrome",
-	"version": "0.15.61",
+	"version": "0.15.62",
 	"scripts": {
 		"test": "node test-suite/unit/csp-eval.test.mjs && node test-suite/unit/automation-target.test.mjs && node test-suite/unit/cdp-passthrough.test.mjs",
 		"version": "node scripts/sync-manifest-version.js",
