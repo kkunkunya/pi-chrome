@@ -5,6 +5,14 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 
+const { extractPanelPages } = require("./panel-extract.js") as {
+	extractPanelPages: (
+		params: Record<string, unknown>,
+		send: (action: string, params: Record<string, unknown>) => Promise<any>,
+		options?: { signal?: AbortSignal; onProgress?: (progress: { index: number; total: number; label: string }) => void },
+	) => Promise<any>;
+};
+
 /**
  * Existing-profile Chrome bridge for pi.
  *
@@ -671,6 +679,7 @@ const CHROME_TOOL_NAMES = [
 	"chrome_snapshot",
 	"chrome_navigate",
 	"chrome_panels",
+	"chrome_panel_extract",
 	"chrome_evaluate",
 	"chrome_click",
 	"chrome_type",
@@ -1005,7 +1014,7 @@ Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
-- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/\`panelUrl\` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. This works for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
+- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/\`panelUrl\` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. \`chrome_panel_extract\` traverses caller-supplied panel navigation labels and saves each page's DOM text to JSON. These work for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
@@ -1577,6 +1586,57 @@ Usage rules:
 							)
 							.join("\n");
 			return { content: [{ type: "text", text }], details: { panels: panels as Json } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chrome_panel_extract",
+		label: "Chrome Panel Extract",
+		description:
+			"Traverse caller-supplied navigation labels in one open http(s)-hosted Chrome side panel and save each page's DOM text to a JSON artifact. Uses full DOM mouse events, waits outside the page so background timer throttling cannot hang it, never retries a click, isolates per-page failures, and marks unchanged/uncertain pages instead of claiming they switched. Use chrome_panels first and pass one panelId whenever multiple instances exist.",
+		promptSnippet: "Extract every requested subpage from an open Chrome extension side panel to JSON.",
+		parameters: Type.Object({
+			labels: Type.Array(Type.String({ description: "Exact visible navigation label." }), { minItems: 1, maxItems: 50, description: "Ordered unique navigation labels to visit." }),
+			panelId: Type.Optional(Type.String({ description: "Exact panel target id from chrome_panels. Preferred when multiple panel instances share a URL." })),
+			panelUrl: Type.Optional(Type.String({ description: "URL substring matching one open panel. Use only when unambiguous." })),
+			navigationSelector: Type.Optional(Type.String({ description: "CSS selector for navigation candidates. Defaults to buttons, links, and tab/button roles." })),
+			textSelector: Type.Optional(Type.String({ description: "CSS selector whose innerText is captured after each navigation. Defaults to body." })),
+			minWaitMs: Type.Optional(Type.Number({ default: 4_000, description: "Minimum bridge-side wait after each click before content may be accepted; 0-20000ms." })),
+			pageTimeoutMs: Type.Optional(Type.Number({ default: 20_000, description: "Maximum wait per label; 1000-60000ms." })),
+			pollIntervalMs: Type.Optional(Type.Number({ default: 1_000, description: "Bridge-side text poll interval; 250-5000ms." })),
+			maxTextChars: Type.Optional(Type.Number({ default: 500_000, description: "Maximum captured characters per page; 1-2000000." })),
+			path: Type.Optional(Type.String({ description: "Output JSON path. Defaults to .pi/chrome-panel-extracts/<timestamp>.json." })),
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal, onUpdate, ctx): Promise<ToolTextResult> {
+			const cwd = workspaceCwd(ctx);
+			const defaultPath = join(cwd, ".pi", "chrome-panel-extracts", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			const result = await extractPanelPages(
+				params as unknown as Record<string, unknown>,
+				(action, actionParams) => authorizedBridgeSend(action, actionParams, DEFAULT_TIMEOUT_MS, signal),
+				{
+					signal,
+					onProgress: ({ index, total, label }) => onUpdate?.({
+						content: [{ type: "text", text: `Extracting panel page ${index + 1}/${total}: ${label}` }],
+						details: { index, total, label },
+					}),
+				},
+			);
+			await mkdir(dirname(outputPath), { recursive: true });
+			await writeFile(outputPath, JSON.stringify(result, null, 2));
+			const pages = result.pages as Array<{ label: string; status: string; textLength?: number; truncated?: boolean; duplicateOf?: string; error?: string; errors?: string[] }>;
+			const counts = pages.reduce((out: Record<string, number>, page) => {
+				out[page.status] = (out[page.status] || 0) + 1;
+				return out;
+			}, {});
+			const pageLines = pages.map((page) => `- ${page.label}: ${page.status}${page.duplicateOf ? ` of ${page.duplicateOf}` : ""}${typeof page.textLength === "number" ? `, ${page.textLength} chars` : ""}${page.truncated ? " (truncated)" : ""}${page.error ? ` — ${compactLine(page.error)}` : ""}${page.errors?.length ? ` — ${compactLine(page.errors.join("; "))}` : ""}`);
+			const summary = Object.entries(counts).map(([status, count]) => `${status}=${count}`).join(", ");
+			return {
+				content: [{ type: "text", text: truncateText(`Saved ${pages.length} panel page(s) to ${outputPath}\n${summary}\n\n${pageLines.join("\n")}`) }],
+				details: { path: outputPath, counts, pages: pages.map(({ label, status, textLength, truncated, duplicateOf, error, errors }) => ({ label, status, textLength, truncated, duplicateOf, error, errors })) },
+			};
 		},
 	});
 

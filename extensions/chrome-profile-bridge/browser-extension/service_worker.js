@@ -389,6 +389,83 @@ async function probePanelTarget(target) {
   }
 }
 
+function panelReadTextExpression(params) {
+  const selector = String(params.textSelector || "body").trim();
+  if (!selector || selector.length > 500) throw new Error("panel.readText requires textSelector of 1-500 characters");
+  const maxTextChars = Math.max(1, Math.min(2_000_000, Number(params.maxTextChars) || 500_000));
+  return `(() => {
+    const root = document.querySelector(${JSON.stringify(selector)});
+    if (!root) return { ok: false, error: ${JSON.stringify(`No element matched textSelector ${selector}`)} };
+    const text = String(root.innerText ?? root.textContent ?? "");
+    return {
+      ok: true,
+      text: text.slice(0, ${maxTextChars}),
+      textLength: text.length,
+      truncated: text.length > ${maxTextChars},
+      title: document.title || "",
+      url: location.href,
+      readyState: document.readyState,
+    };
+  })()`;
+}
+
+function panelClickTextExpression(params) {
+  const label = String(params.label || "").replace(/\s+/g, " ").trim();
+  const selector = String(params.navigationSelector || 'button,[role="tab"],[role="button"],a').trim();
+  if (!label || label.length > 200) throw new Error("panel.clickText requires label of 1-200 characters");
+  if (!selector || selector.length > 500) throw new Error("panel.clickText requires navigationSelector of 1-500 characters");
+  return `(() => {
+    const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const wanted = ${JSON.stringify(label)};
+    const candidates = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
+    const labelOf = (el) => normalize(el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title"));
+    const visible = (el) => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+    const element = candidates.find((el) => labelOf(el) === wanted && visible(el));
+    if (!element) {
+      return {
+        ok: false,
+        error: "No visible navigation element matched " + JSON.stringify(wanted),
+        candidates: candidates.map(labelOf).filter(Boolean).slice(0, 30),
+      };
+    }
+    const rect = element.getBoundingClientRect();
+    const init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      button: 0,
+      buttons: 1,
+    };
+    element.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
+    element.dispatchEvent(new MouseEvent("mousedown", init));
+    element.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
+    element.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
+    element.dispatchEvent(new MouseEvent("click", { ...init, buttons: 0 }));
+    return {
+      ok: true,
+      label: labelOf(element),
+      tag: element.tagName,
+      ariaSelected: element.getAttribute("aria-selected"),
+      ariaCurrent: element.getAttribute("aria-current"),
+    };
+  })()`;
+}
+
+async function readPanelText(params) {
+  return evaluateInPanel({ ...params, expression: panelReadTextExpression(params) });
+}
+
+async function clickPanelText(params) {
+  return evaluateInPanel({ ...params, expression: panelClickTextExpression(params) });
+}
+
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
     if (tabId !== undefined) attachedTabs.delete(tabId);
@@ -1391,6 +1468,10 @@ async function dispatch(action, params) {
       }
       return Array.from(seenByUrl.values());
     }
+    case "panel.readText":
+      return readPanelText(params);
+    case "panel.clickText":
+      return clickPanelText(params);
     case "page.snapshot":
       return snapshotInTab(params);
     case "page.inspect":
