@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 
@@ -9,7 +9,7 @@ const { extractPanelPages } = require("./panel-extract.js") as {
 	extractPanelPages: (
 		params: Record<string, unknown>,
 		send: (action: string, params: Record<string, unknown>) => Promise<any>,
-		options?: { signal?: AbortSignal; onProgress?: (progress: { index: number; total: number; label: string }) => void },
+		options?: { signal?: AbortSignal; onProgress?: (progress: { index: number; total: number; label: string }) => void; onPage?: (artifact: any) => Promise<void> },
 	) => Promise<any>;
 };
 
@@ -1613,6 +1613,12 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-panel-extracts", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
+			await mkdir(dirname(outputPath), { recursive: true });
+			const saveArtifact = async (artifact: unknown) => {
+				const partialPath = `${outputPath}.tmp`;
+				await writeFile(partialPath, JSON.stringify(artifact, null, 2));
+				await rename(partialPath, outputPath);
+			};
 			const result = await extractPanelPages(
 				params as unknown as Record<string, unknown>,
 				(action, actionParams) => authorizedBridgeSend(action, actionParams, DEFAULT_TIMEOUT_MS, signal),
@@ -1622,10 +1628,10 @@ Usage rules:
 						content: [{ type: "text", text: `Extracting panel page ${index + 1}/${total}: ${label}` }],
 						details: { index, total, label },
 					}),
+					onPage: saveArtifact,
 				},
 			);
-			await mkdir(dirname(outputPath), { recursive: true });
-			await writeFile(outputPath, JSON.stringify(result, null, 2));
+			await saveArtifact(result);
 			const pages = result.pages as Array<{ label: string; status: string; textLength?: number; truncated?: boolean; duplicateOf?: string; error?: string; errors?: string[] }>;
 			const counts = pages.reduce((out: Record<string, number>, page) => {
 				out[page.status] = (out[page.status] || 0) + 1;

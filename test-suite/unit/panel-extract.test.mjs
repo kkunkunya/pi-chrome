@@ -118,6 +118,19 @@ async function run() {
   }
 
   {
+    const checkpoints = [];
+    const c = clock();
+    const result = await extractPanelPages(
+      { panelId: "p", labels: ["A", "B"], minWaitMs: 250, pageTimeoutMs: 1000, pollIntervalMs: 250 },
+      async (action, params) => action === "panel.clickText"
+        ? { ok: true }
+        : { ok: true, text: params?.label || "stable", textLength: 6 },
+      { now: c.now, sleep: c.sleep, onPage: async (artifact) => checkpoints.push(artifact.pages.length) },
+    );
+    ok(checkpoints.join(",") === "1,2" && result.completedAt !== null, "emits a recoverable artifact checkpoint after every page");
+  }
+
+  {
     const c = clock();
     let label = "Broken";
     const result = await extractPanelPages(

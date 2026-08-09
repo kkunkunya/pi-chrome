@@ -55,6 +55,7 @@ async function extractPanelPages(params, send, options = {}) {
   const sleep = options.sleep || delay;
   const now = options.now || Date.now;
   const onProgress = options.onProgress;
+  const onPage = options.onPage;
   const target = params.panelId ? { panelId: params.panelId } : { panelUrl: params.panelUrl };
   const readParams = { ...target, textSelector: config.textSelector, maxTextChars: config.maxTextChars };
   let previousText;
@@ -65,6 +66,24 @@ async function extractPanelPages(params, send, options = {}) {
 
   const startedAt = new Date(now()).toISOString();
   const pages = [];
+  const artifact = (completedAt = null) => ({
+    panel: target,
+    startedAt,
+    completedAt,
+    options: {
+      navigationSelector: config.navigationSelector,
+      textSelector: config.textSelector,
+      maxTextChars: config.maxTextChars,
+      minWaitMs: config.minWaitMs,
+      pageTimeoutMs: config.pageTimeoutMs,
+      pollIntervalMs: config.pollIntervalMs,
+    },
+    pages,
+  });
+  const addPage = async (page) => {
+    pages.push(page);
+    await onPage?.(artifact());
+  };
   const seenTexts = new Map(previousText === undefined ? [] : [[previousText, "baseline"]]);
   for (let index = 0; index < config.labels.length; index++) {
     if (signal?.aborted) throw abortError();
@@ -80,7 +99,7 @@ async function extractPanelPages(params, send, options = {}) {
     try {
       const click = await send("panel.clickText", { ...target, label, navigationSelector: config.navigationSelector });
       if (!click?.ok) {
-        pages.push({ label, status: "not-found", clicked: false, elapsedMs: now() - pageStarted, error: click?.error || "navigation element not found", candidates: click?.candidates || [] });
+        await addPage({ label, status: "not-found", clicked: false, elapsedMs: now() - pageStarted, error: click?.error || "navigation element not found", candidates: click?.candidates || [] });
         continue;
       }
       clicked = true;
@@ -113,12 +132,12 @@ async function extractPanelPages(params, send, options = {}) {
     }
 
     if (!latest) {
-      pages.push({ label, status: clickUnknown ? "click-unknown" : "read-error", clicked, elapsedMs: now() - pageStarted, attempts, errors });
+      await addPage({ label, status: clickUnknown ? "click-unknown" : "read-error", clicked, elapsedMs: now() - pageStarted, attempts, errors });
       continue;
     }
     const duplicateOf = latest.text === previousText ? undefined : seenTexts.get(latest.text);
     const status = clickUnknown ? "click-unknown" : latest.text === previousText ? "unchanged" : duplicateOf ? "duplicate" : "changed";
-    pages.push({
+    await addPage({
       label,
       status,
       ...(duplicateOf ? { duplicateOf } : {}),
@@ -136,21 +155,7 @@ async function extractPanelPages(params, send, options = {}) {
     previousText = latest.text;
   }
 
-  const completedAt = new Date(now()).toISOString();
-  return {
-    panel: target,
-    startedAt,
-    completedAt,
-    options: {
-      navigationSelector: config.navigationSelector,
-      textSelector: config.textSelector,
-      maxTextChars: config.maxTextChars,
-      minWaitMs: config.minWaitMs,
-      pageTimeoutMs: config.pageTimeoutMs,
-      pollIntervalMs: config.pollIntervalMs,
-    },
-    pages,
-  };
+  return artifact(new Date(now()).toISOString());
 }
 
 module.exports = { extractPanelPages, normalizeOptions };
