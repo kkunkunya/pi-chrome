@@ -1003,7 +1003,7 @@ Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
-- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/`panelUrl` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. This works for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
+- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/\`panelUrl\` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. This works for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
@@ -1570,8 +1570,7 @@ Usage rules:
 								(p) =>
 									`${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}`,
 							)
-							.join("
-");
+							.join("\n");
 			return { content: [{ type: "text", text }], details: { panels: panels as Json } };
 		},
 	});
