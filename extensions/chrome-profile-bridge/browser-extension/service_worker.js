@@ -337,6 +337,49 @@ async function detachAll() {
   await Promise.all(ids.map(detachDebugger));
 }
 
+// =================== Side panel (non-tab CDP target) support ===================
+// Extension side panels (chrome.sidePanel, e.g. AITDK) are NOT tabs: they are non-tab
+// CDP targets (type "other"/"page", no tabId) rendered next to a window. chrome.debugger
+// can attach to them via {targetId} when they are hosted at a plain http(s) URL
+// (e.g. https://extension.aitdk.com/). chrome-extension:// pages of other extensions
+// remain blocked by Chrome ("Cannot access a chrome-extension:// URL of different
+// extension"); those panels fall back to screenshot-only coverage via
+// chrome.tabs.captureVisibleTab (the visible window includes the panel).
+async function findPanelTarget(params) {
+  const panelId = params.panelId ? String(params.panelId) : "";
+  const panelUrl = params.panelUrl ? String(params.panelUrl) : "";
+  if (!panelId && !panelUrl) return null;
+  const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+  return targets.find((t) => {
+    if (t.tabId !== undefined && t.tabId !== null) return false;
+    const url = String(t.url || "");
+    if (!/^https?:/i.test(url)) return false;
+    if (panelId && t.id === panelId) return true;
+    if (panelUrl && url.includes(panelUrl)) return true;
+    return false;
+  }) || null;
+}
+
+async function attachPanel(target) {
+  const debuggee = { targetId: target.id };
+  await withTimeout(chrome.debugger.attach(debuggee, CDP_VERSION), ATTACH_TIMEOUT_MS, `attach debugger to panel ${target.url}`);
+  return debuggee;
+}
+
+async function probePanelTarget(target) {
+  const debuggee = { targetId: target.id };
+  try {
+    await attachPanel(target);
+    const res = await cdpEvalOn(debuggee, "({ title: document.title || '', topLevel: window.self === window.top, textLen: (document.body ? document.body.innerText : '').length, width: window.innerWidth, height: window.innerHeight })");
+    if (res.exceptionDetails) return {};
+    return res && res.result ? res.result.value : {};
+  } catch (e) {
+    return { attachError: String(e.message || e).slice(0, 300) };
+  } finally {
+    try { await chrome.debugger.detach(debuggee); } catch {}
+  }
+}
+
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
     if (tabId !== undefined) attachedTabs.delete(tabId);
@@ -374,16 +417,24 @@ setInterval(() => {
   }
 }, 5000);
 
-function cdpRaw(tabId, method, params) {
-  const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+function cdpRawOn(debuggee, method, params) {
   return withTimeout(new Promise((resolve, reject) => {
     chrome.debugger.sendCommand(debuggee, method, params || {}, (result) => {
       if (chrome.runtime.lastError) reject(new Error(`${method}: ${chrome.runtime.lastError.message}`));
       else resolve(result);
     });
-  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`, async () => {
-    attachedTabs.delete(tabId);
-    try { await chrome.debugger.detach(debuggee); } catch {}
+  }), CDP_COMMAND_TIMEOUT_MS, `CDP ${method}`);
+}
+
+function cdpRaw(tabId, method, params) {
+  const debuggee = attachedTabs.get(tabId)?.debuggee || { tabId };
+  return cdpRawOn(debuggee, method, params).catch((error) => {
+    // Keep the tab-attach cleanup on the original path: if the command fails while the
+    // session is cached, drop it so the next call re-attaches fresh.
+    if (/\bDebugger is not attached\b|Detached while|Target closed/i.test(String(error?.message || error))) {
+      attachedTabs.delete(tabId);
+    }
+    throw error;
   });
 }
 
@@ -476,6 +527,16 @@ async function cdp(tabId, method, params) {
 async function cdpEval(tabId, expression, opts) {
   await attachDebugger(tabId);
   return cdp(tabId, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+    userGesture: true,
+    ...(opts || {}),
+  });
+}
+
+function cdpEvalOn(debuggee, expression, opts) {
+  return cdpRawOn(debuggee, "Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
@@ -1264,6 +1325,24 @@ async function dispatch(action, params) {
       await chrome.tabs.remove(tab.id);
       return { closed: tab.id };
     }
+    case "panel.list": {
+      // Enumerate non-tab http(s) CDP targets (open side panels) and probe each for
+      // title / top-level-ness / text size. attachError marks panels Chrome blocks
+      // (chrome-extension:// pages of other extensions).
+      const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
+      const panels = [];
+      for (const t of targets) {
+        const url = String(t.url || "");
+        if (t.tabId !== undefined && t.tabId !== null) continue;
+        if (!/^https?:/i.test(url)) continue;
+        const probe = await probePanelTarget(t);
+        // Only top-level pages are side panels; workers and embedded iframes (which
+        // probe as topLevel:false or empty) are filtered out.
+        if (!probe || probe.topLevel !== true) continue;
+        panels.push({ id: t.id, type: t.type, url, ...probe });
+      }
+      return panels;
+    }
     case "page.snapshot":
       return snapshotInTab(params);
     case "page.inspect":
@@ -1352,6 +1431,9 @@ async function dispatch(action, params) {
       // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
       // another Pi session's target.
       return cleanupAutomationTarget(sessionKeyOf(params));
+
+
+
     default:
       throw new Error(`Unknown action: ${action}`);
   }
@@ -1551,10 +1633,9 @@ function piEvalStringify(v) {
 // Dedicated executor for page.evaluate. Uses CDP Runtime.evaluate (via cdpEval) which is not
 // subject to the page's CSP, fixing `chrome_evaluate` silently returning null / failing on
 // pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
-async function evaluateInTab(params) {
-  const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
-  const expression = String(params.expression ?? "");
+// Shared chrome_evaluate body: runs the user expression through piEvalStringify via the
+// given evaluator (tab or panel debuggee), with the expression-form/statement-form fallback.
+async function runExpression(ev, expression) {
   const stringifySrc = `(${piEvalStringify.toString()})`;
   // Wrap the user expression so the result is run through piEvalStringify in-page before it
   // crosses the returnByValue boundary. Try expression form first (so `1+1` / `document.title`
@@ -1564,9 +1645,9 @@ async function evaluateInTab(params) {
   const exprForm = `(async () => (${expression}))()`;
   const stmtForm = `(async () => { ${expression} })()`;
 
-  let res = await cdpEval(tab.id, buildWrapper(exprForm));
+  let res = await ev(buildWrapper(exprForm));
   if (res.exceptionDetails && cdpIsSyntaxError(res.exceptionDetails)) {
-    res = await cdpEval(tab.id, buildWrapper(stmtForm));
+    res = await ev(buildWrapper(stmtForm));
   }
   if (res.exceptionDetails) {
     throw new Error(`chrome_evaluate failed: ${cdpExceptionText(res.exceptionDetails) || "evaluation failed"}`);
@@ -1583,6 +1664,29 @@ async function evaluateInTab(params) {
     if (v.kind === "error") throw new Error(`${v.name}: ${v.message}\n${v.stack || ""}`);
   }
   return v;
+}
+
+async function evaluateInTab(params) {
+  if (params.panelId || params.panelUrl) return evaluateInPanel(params);
+  const tab = await getTabByParams(params);
+  if (params.foreground) await bringToFront(tab);
+  return runExpression((expression) => cdpEval(tab.id, expression), String(params.expression ?? ""));
+}
+
+async function evaluateInPanel(params) {
+  const target = await findPanelTarget(params);
+  if (!target) {
+    throw new Error(
+      `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
+      "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
+    );
+  }
+  const debuggee = await attachPanel(target);
+  try {
+    return await runExpression((expression) => cdpEvalOn(debuggee, expression), String(params.expression ?? ""));
+  } finally {
+    try { await chrome.debugger.detach(debuggee); } catch {}
+  }
 }
 
 async function withOptionalSnapshot(params, actionFn) {
@@ -1737,6 +1841,27 @@ function waitForTabComplete(tabId, timeoutMs) {
 }
 
 async function takeScreenshot(params) {
+  if (params.panelId || params.panelUrl) {
+    const target = await findPanelTarget(params);
+    if (!target) {
+      throw new Error(
+        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
+        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
+      );
+    }
+    const debuggee = await attachPanel(target);
+    try {
+      const format = params.format || "png";
+      const captured = await cdpRawOn(debuggee, "Page.captureScreenshot", {
+        format,
+        quality: format === "jpeg" ? params.quality : undefined,
+      });
+      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
+      return { dataUrl: `data:image/${format};base64,${captured.data}`, panel: { id: target.id, url: target.url, title: target.title || "" } };
+    } finally {
+      try { await chrome.debugger.detach(debuggee); } catch {}
+    }
+  }
   const tab = await getTabByParams(params);
 
   // captureVisibleTab requires activating the target tab. In background mode that

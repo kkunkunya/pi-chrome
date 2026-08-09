@@ -670,6 +670,7 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tab",
 	"chrome_snapshot",
 	"chrome_navigate",
+	"chrome_panels",
 	"chrome_evaluate",
 	"chrome_click",
 	"chrome_type",
@@ -1002,6 +1003,7 @@ Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
+- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/`panelUrl` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. This works for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
@@ -1540,14 +1542,51 @@ Usage rules:
 	});
 
 	pi.registerTool({
+		name: "chrome_panels",
+		label: "Chrome Panels",
+		description:
+			"List open browser side panels. Extension side panels (e.g. AITDK) are not tabs — they are non-tab CDP targets the bridge can attach to when hosted at an http(s) URL. Returns each panel's id, url, title, and text length; panels Chrome blocks (chrome-extension:// pages of other extensions) are omitted. Pass the id to chrome_evaluate / chrome_screenshot via panelId (or panelUrl substring).",
+		promptSnippet: "List open Chrome extension side panels.",
+		parameters: Type.Object({
+			host: Type.Optional(Type.String()),
+			port: Type.Optional(Type.Number()),
+		}),
+		async execute(_id, params, signal): Promise<ToolTextResult> {
+			const panels = (await authorizedBridgeSend("panel.list", params, DEFAULT_TIMEOUT_MS, signal)) as Array<{
+				id: string;
+				url: string;
+				title?: string;
+				topLevel?: boolean;
+				textLen?: number;
+				width?: number;
+				height?: number;
+				attachError?: string;
+			}>;
+			const text =
+				(panels || []).length === 0
+					? "No open side panels (http(s)-hosted panels only; chrome-extension:// panels of other extensions are not attachable)."
+					: (panels || [])
+							.map(
+								(p) =>
+									`${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}`,
+							)
+							.join("
+");
+			return { content: [{ type: "text", text }], details: { panels: panels as Json } };
+		},
+	});
+
+	pi.registerTool({
 		name: "chrome_evaluate",
 		label: "Chrome Evaluate",
 		description:
-			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
+			"Evaluate JavaScript in an existing Chrome tab through the companion extension, or in an open side panel when panelId/panelUrl is given. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
 		promptSnippet: "Evaluate JavaScript in the active Chrome tab through the companion extension.",
 		parameters: Type.Object({
 			expression: Type.String(),
 			awaitPromise: Type.Optional(Type.Boolean({ default: true })),
+			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); evaluates in the panel context instead of a tab." })),
+			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels); evaluates in the panel context instead of a tab." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -1792,13 +1831,15 @@ Usage rules:
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
+			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk, or of an open side panel when panelId/panelUrl is given. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
 			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured." })),
+			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); captures the panel instead of a tab." })),
+			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels); captures the panel instead of a tab." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
