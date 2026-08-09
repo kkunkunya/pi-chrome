@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { withFileMutationQueue, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
@@ -1613,36 +1613,38 @@ Usage rules:
 			const cwd = workspaceCwd(ctx);
 			const defaultPath = join(cwd, ".pi", "chrome-panel-extracts", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
 			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			await mkdir(dirname(outputPath), { recursive: true });
-			const saveArtifact = async (artifact: unknown) => {
-				const partialPath = `${outputPath}.tmp`;
-				await writeFile(partialPath, JSON.stringify(artifact, null, 2));
-				await rename(partialPath, outputPath);
-			};
-			const result = await extractPanelPages(
-				params as unknown as Record<string, unknown>,
-				(action, actionParams) => authorizedBridgeSend(action, actionParams, DEFAULT_TIMEOUT_MS, signal),
-				{
-					signal,
-					onProgress: ({ index, total, label }) => onUpdate?.({
-						content: [{ type: "text", text: `Extracting panel page ${index + 1}/${total}: ${label}` }],
-						details: { index, total, label },
-					}),
-					onPage: saveArtifact,
-				},
-			);
-			await saveArtifact(result);
-			const pages = result.pages as Array<{ label: string; status: string; textLength?: number; truncated?: boolean; duplicateOf?: string; error?: string; errors?: string[] }>;
-			const counts = pages.reduce((out: Record<string, number>, page) => {
-				out[page.status] = (out[page.status] || 0) + 1;
-				return out;
-			}, {});
-			const pageLines = pages.map((page) => `- ${page.label}: ${page.status}${page.duplicateOf ? ` of ${page.duplicateOf}` : ""}${typeof page.textLength === "number" ? `, ${page.textLength} chars` : ""}${page.truncated ? " (truncated)" : ""}${page.error ? ` — ${compactLine(page.error)}` : ""}${page.errors?.length ? ` — ${compactLine(page.errors.join("; "))}` : ""}`);
-			const summary = Object.entries(counts).map(([status, count]) => `${status}=${count}`).join(", ");
-			return {
-				content: [{ type: "text", text: truncateText(`Saved ${pages.length} panel page(s) to ${outputPath}\n${summary}\n\n${pageLines.join("\n")}`) }],
-				details: { path: outputPath, counts, pages: pages.map(({ label, status, textLength, truncated, duplicateOf, error, errors }) => ({ label, status, textLength, truncated, duplicateOf, error, errors })) },
-			};
+			return withFileMutationQueue(outputPath, async () => {
+				await mkdir(dirname(outputPath), { recursive: true });
+				const saveArtifact = async (artifact: unknown) => {
+					const partialPath = `${outputPath}.tmp`;
+					await writeFile(partialPath, JSON.stringify(artifact, null, 2));
+					await rename(partialPath, outputPath);
+				};
+				const result = await extractPanelPages(
+					params as unknown as Record<string, unknown>,
+					(action, actionParams) => authorizedBridgeSend(action, actionParams, DEFAULT_TIMEOUT_MS, signal),
+					{
+						signal,
+						onProgress: ({ index, total, label }) => onUpdate?.({
+							content: [{ type: "text", text: `Extracting panel page ${index + 1}/${total}: ${label}` }],
+							details: { index, total, label },
+						}),
+						onPage: saveArtifact,
+					},
+				);
+				await saveArtifact(result);
+				const pages = result.pages as Array<{ label: string; status: string; textLength?: number; truncated?: boolean; duplicateOf?: string; error?: string; errors?: string[] }>;
+				const counts = pages.reduce((out: Record<string, number>, page) => {
+					out[page.status] = (out[page.status] || 0) + 1;
+					return out;
+				}, {});
+				const pageLines = pages.map((page) => `- ${page.label}: ${page.status}${page.duplicateOf ? ` of ${page.duplicateOf}` : ""}${typeof page.textLength === "number" ? `, ${page.textLength} chars` : ""}${page.truncated ? " (truncated)" : ""}${page.error ? ` — ${compactLine(page.error)}` : ""}${page.errors?.length ? ` — ${compactLine(page.errors.join("; "))}` : ""}`);
+				const summary = Object.entries(counts).map(([status, count]) => `${status}=${count}`).join(", ");
+				return {
+					content: [{ type: "text", text: truncateText(`Saved ${pages.length} panel page(s) to ${outputPath}\n${summary}\n\n${pageLines.join("\n")}`) }],
+					details: { path: outputPath, counts, pages: pages.map(({ label, status, textLength, truncated, duplicateOf, error, errors }) => ({ label, status, textLength, truncated, duplicateOf, error, errors })) },
+				};
+			});
 		},
 	});
 
