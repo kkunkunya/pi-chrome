@@ -1,17 +1,9 @@
-import { withFileMutationQueue, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
-
-const { extractPanelPages } = require("./panel-extract.js") as {
-	extractPanelPages: (
-		params: Record<string, unknown>,
-		send: (action: string, params: Record<string, unknown>) => Promise<any>,
-		options?: { signal?: AbortSignal; onProgress?: (progress: { index: number; total: number; label: string }) => void; onPage?: (artifact: any) => Promise<void> },
-	) => Promise<any>;
-};
 
 /**
  * Existing-profile Chrome bridge for pi.
@@ -247,6 +239,7 @@ function summarizeActionResult(result: unknown): string | undefined {
 	if (!result || typeof result !== "object") return undefined;
 	const r = result as Record<string, unknown>;
 	const parts: string[] = [];
+	if (r.input === "dom-fallback") parts.push("WARNING: synthetic DOM fallback (isTrusted=false)");
 	// NOTE: pageMutated is a coarse heuristic (a hash over body text + input values + node count).
 	// Many real effects — class/aria/data-state toggles, JS-held state, canvas, async updates —
 	// don't move it, so a false value is NOT proof the action did nothing. Surface it only as a
@@ -678,8 +671,6 @@ const CHROME_TOOL_NAMES = [
 	"chrome_tab",
 	"chrome_snapshot",
 	"chrome_navigate",
-	"chrome_panels",
-	"chrome_panel_extract",
 	"chrome_evaluate",
 	"chrome_click",
 	"chrome_type",
@@ -809,13 +800,11 @@ export default function (pi: ExtensionAPI): void {
 		}, { triggerTurn: false });
 	};
 
-	// Close THIS session's dedicated automation window/tab. Fire-and-forget and best-effort: it
-	// must never block /quit, /reload, revoke, or session end, and the service-worker side only
-	// ever closes targets this session created itself (never user tabs/windows, never another
-	// session's target). Errors (bridge down, target already closed) are intentionally swallowed.
-	const cleanupAutomationTargetBestEffort = (): void => {
+	// Close browser resources owned by THIS session. Revoke remains fire-and-forget, while real
+	// session shutdown awaits a bounded request before stopping the bridge.
+	const cleanupAutomationTargetBestEffort = async (timeoutMs = 3_000): Promise<void> => {
 		const sessionKey = sessionKeyFor(sessionCtx);
-		void bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, 3_000).catch(() => undefined);
+		await bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, timeoutMs).catch(() => undefined);
 	};
 
 	const lockChromeControl = (logAction?: "revoked" | "expired"): void => {
@@ -827,8 +816,8 @@ export default function (pi: ExtensionAPI): void {
 		if (logAction && wasUsable) logChromeToolChange(logAction, { authorizedUntil: undefined });
 		chromeAuthorizedUntil = undefined;
 		persistAuth();
-		// Revoking control ends pi-chrome's automation for this session; tidy up the target we own.
-		cleanupAutomationTargetBestEffort();
+		// Revoking control ends pi-chrome's automation for this session; tidy up resources we own.
+		void cleanupAutomationTargetBestEffort();
 	};
 
 	const authSummary = (): string => {
@@ -975,17 +964,12 @@ export default function (pi: ExtensionAPI): void {
 		updateChromeStatus(ctx);
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", async (event) => {
 		clearAuthExpiryTimer();
 		clearCountdownInterval();
-		// Tidy up this session's dedicated automation window on real session end, but NOT on
-		// "reload": /reload tears down and re-evaluates this module while the *same* session
-		// (same sessionKey) continues, so we keep the window so it is reused, not churned. The
-		// call is fire-and-forget and runs before bridge.stop() so it never blocks shutdown.
-		// (Owner-session quit may not deliver in time since stop() closes the bridge server;
-		// that only ever leaves a clearly pi-chrome window for the user to close — never a user
-		// tab — and /chrome revoke remains the reliable, bridge-alive cleanup path.)
-		if (event?.reason !== "reload") cleanupAutomationTargetBestEffort();
+		// /reload continues the same session, so preserve its resources. On real shutdown, wait up
+		// to 2s for Chrome cleanup before bridge.stop() can discard the queued command.
+		if (event?.reason !== "reload") await cleanupAutomationTargetBestEffort(2_000);
 		// Capture server ownership BEFORE stop(): stop() resets mode to undefined,
 		// and only the server-owning session may clear the global singleton flag.
 		// Client-mode sessions (subagents reusing the owner's bridge via the
@@ -1014,7 +998,6 @@ Capability model (important):
 - Interactive controls (click/type/fill/key/hover/drag/scroll/tap) use Chrome's real input layer via chrome.debugger / CDP. Events satisfy normal user-activation gates.
 - Input bypasses page CSP because it is injected at browser input layer, not page JavaScript. Chrome may show the “Pi Chrome Connector started debugging this browser” banner while attached.
 - \`chrome_evaluate\` and \`chrome_snapshot\` run in MAIN world via **CDP \`Runtime.evaluate\`**, which is not subject to the page's Content-Security-Policy. They work even on strict-CSP pages (e.g. github.com, many bank/SaaS apps) that block \`'unsafe-eval'\`. \`chrome_navigate initScript\` likewise injects at document_start via CDP and bypasses CSP. \`chrome_screenshot\`, \`chrome_tab\`, and Chrome input also work under any CSP.
-- Side panels (extension panels docked beside the page, e.g. AITDK) are not tabs and are invisible to tab-based tools. \`chrome_panels\` lists them; pass \`panelId\`/\`panelUrl\` to \`chrome_evaluate\` / \`chrome_screenshot\` to read or capture one. \`chrome_panel_extract\` traverses caller-supplied panel navigation labels and saves each page's DOM text to JSON. These work for panels hosted at http(s) URLs; panels bundled inside another extension's chrome-extension:// page stay blocked by Chrome.
 - Input tools return structured details and support \`includeSnapshot=true\` on click/type/fill/key. Use the fresh snapshot to verify state instead of repeating blindly.
 
 Usage rules:
@@ -1555,117 +1538,14 @@ Usage rules:
 	});
 
 	pi.registerTool({
-		name: "chrome_panels",
-		label: "Chrome Panels",
-		description:
-			"List open browser side panels. Extension side panels (e.g. AITDK) are non-tab CDP targets. Defaults to one representative per panel URL; includeAllInstances=true exposes every per-tab instance with its hostTab, and sessionOnly=true limits hosts to this Pi session's tab group. http(s)-hosted panels are readable; chrome-extension:// panels of other extensions are omitted. Pass a panel id to chrome_panel_extract / chrome_evaluate / chrome_screenshot.",
-		promptSnippet: "List open Chrome extension side panels.",
-		parameters: Type.Object({
-			includeAllInstances: Type.Optional(Type.Boolean({ description: "Return every per-tab panel instance instead of deduplicating by panel URL." })),
-			sessionOnly: Type.Optional(Type.Boolean({ description: "Return only instances hosted by tabs in this Pi session's tab group. Implies host-tab mapping." })),
-			urlIncludes: Type.Optional(Type.String({ description: "Only panels whose own URL contains this substring." })),
-			host: Type.Optional(Type.String()),
-			port: Type.Optional(Type.Number()),
-		}),
-		async execute(_id, params, signal, _onUpdate, ctx): Promise<ToolTextResult> {
-			const forwarded = params.sessionOnly
-				? { ...params, includeAllInstances: true, groupTitle: sessionGroupTitle(ctx) }
-				: params;
-			const panels = (await authorizedBridgeSend("panel.list", forwarded, DEFAULT_TIMEOUT_MS, signal)) as Array<{
-				id: string;
-				url: string;
-				title?: string;
-				topLevel?: boolean;
-				textLen?: number;
-				width?: number;
-				height?: number;
-				current?: boolean;
-				attachError?: string;
-				hostTab?: { id?: number; title?: string; url?: string; group?: { title?: string } | null } | null;
-			}>;
-			const text =
-				(panels || []).length === 0
-					? "No open side panels (http(s)-hosted panels only; chrome-extension:// panels of other extensions are not attachable)."
-					: (panels || [])
-							.map(
-								(p) =>
-									`${p.current ? "[current] " : ""}${p.title ? `"${p.title}" ` : ""}${p.url} [panelId ${p.id}]${typeof p.textLen === "number" ? `, ${p.textLen} chars` : ""}${p.width ? `, ${p.width}x${p.height}px` : ""}${p.hostTab ? `\n  hostTab ${p.hostTab.id}: ${p.hostTab.title || "(untitled)"} — ${p.hostTab.url || ""}${p.hostTab.group?.title ? ` [${p.hostTab.group.title}]` : ""}` : ""}${p.current ? " (active host tab)" : ""}`,
-							)
-							.join("\n");
-			return { content: [{ type: "text", text }], details: { panels: panels as Json } };
-		},
-	});
-
-	pi.registerTool({
-		name: "chrome_panel_extract",
-		label: "Chrome Panel Extract",
-		description:
-			"Traverse caller-supplied navigation labels in one open http(s)-hosted Chrome side panel and save each page's DOM text to a JSON artifact. Uses full DOM mouse events, waits outside the page so background timer throttling cannot hang it, never retries a click, isolates per-page failures, and marks unchanged/uncertain pages instead of claiming they switched. Use chrome_panels first and pass one panelId whenever multiple instances exist.",
-		promptSnippet: "Extract every requested subpage from an open Chrome extension side panel to JSON.",
-		parameters: Type.Object({
-			labels: Type.Array(Type.String({ description: "Exact visible navigation label." }), { minItems: 1, maxItems: 50, description: "Ordered unique navigation labels to visit." }),
-			panelId: Type.Optional(Type.String({ description: "Exact panel target id from chrome_panels. Preferred when multiple panel instances share a URL." })),
-			panelUrl: Type.Optional(Type.String({ description: "URL substring matching one open panel. Use only when unambiguous." })),
-			navigationSelector: Type.Optional(Type.String({ description: "CSS selector for navigation candidates. Defaults to buttons, links, and tab/button roles." })),
-			textSelector: Type.Optional(Type.String({ description: "CSS selector whose innerText is captured after each navigation. Defaults to body." })),
-			minWaitMs: Type.Optional(Type.Number({ default: 4_000, description: "Minimum bridge-side wait after each click before content may be accepted; 0-20000ms." })),
-			pageTimeoutMs: Type.Optional(Type.Number({ default: 20_000, description: "Maximum wait per label; 1000-60000ms." })),
-			pollIntervalMs: Type.Optional(Type.Number({ default: 1_000, description: "Bridge-side text poll interval; 250-5000ms." })),
-			maxTextChars: Type.Optional(Type.Number({ default: 500_000, description: "Maximum captured characters per page; 1-2000000." })),
-			path: Type.Optional(Type.String({ description: "Output JSON path. Defaults to .pi/chrome-panel-extracts/<timestamp>.json." })),
-			host: Type.Optional(Type.String()),
-			port: Type.Optional(Type.Number()),
-		}),
-		async execute(_id, params, signal, onUpdate, ctx): Promise<ToolTextResult> {
-			const cwd = workspaceCwd(ctx);
-			const defaultPath = join(cwd, ".pi", "chrome-panel-extracts", `${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
-			const outputPath = params.path ? resolve(cwd, params.path) : defaultPath;
-			return withFileMutationQueue(outputPath, async () => {
-				await mkdir(dirname(outputPath), { recursive: true });
-				const saveArtifact = async (artifact: unknown) => {
-					const partialPath = `${outputPath}.tmp`;
-					await writeFile(partialPath, JSON.stringify(artifact, null, 2));
-					await rename(partialPath, outputPath);
-				};
-				const result = await extractPanelPages(
-					params as unknown as Record<string, unknown>,
-					(action, actionParams) => authorizedBridgeSend(action, actionParams, DEFAULT_TIMEOUT_MS, signal),
-					{
-						signal,
-						onProgress: ({ index, total, label }) => onUpdate?.({
-							content: [{ type: "text", text: `Extracting panel page ${index + 1}/${total}: ${label}` }],
-							details: { index, total, label },
-						}),
-						onPage: saveArtifact,
-					},
-				);
-				await saveArtifact(result);
-				const pages = result.pages as Array<{ label: string; status: string; textLength?: number; truncated?: boolean; duplicateOf?: string; error?: string; errors?: string[] }>;
-				const counts = pages.reduce((out: Record<string, number>, page) => {
-					out[page.status] = (out[page.status] || 0) + 1;
-					return out;
-				}, {});
-				const pageLines = pages.map((page) => `- ${page.label}: ${page.status}${page.duplicateOf ? ` of ${page.duplicateOf}` : ""}${typeof page.textLength === "number" ? `, ${page.textLength} chars` : ""}${page.truncated ? " (truncated)" : ""}${page.error ? ` — ${compactLine(page.error)}` : ""}${page.errors?.length ? ` — ${compactLine(page.errors.join("; "))}` : ""}`);
-				const summary = Object.entries(counts).map(([status, count]) => `${status}=${count}`).join(", ");
-				return {
-					content: [{ type: "text", text: truncateText(`Saved ${pages.length} panel page(s) to ${outputPath}\n${summary}\n\n${pageLines.join("\n")}`) }],
-					details: { path: outputPath, counts, pages: pages.map(({ label, status, textLength, truncated, duplicateOf, error, errors }) => ({ label, status, textLength, truncated, duplicateOf, error, errors })) },
-				};
-			});
-		},
-	});
-
-	pi.registerTool({
 		name: "chrome_evaluate",
 		label: "Chrome Evaluate",
 		description:
-			"Evaluate JavaScript in an existing Chrome tab through the companion extension, or in an open side panel when panelId/panelUrl is given. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
+			"Evaluate JavaScript in an existing Chrome tab through the companion extension. Runs in the page context and returns JSON-serializable values when possible. Runs in the background by default; pass background=false to focus Chrome and activate the tab.",
 		promptSnippet: "Evaluate JavaScript in the active Chrome tab through the companion extension.",
 		parameters: Type.Object({
 			expression: Type.String(),
 			awaitPromise: Type.Optional(Type.Boolean({ default: true })),
-			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); evaluates in the panel context instead of a tab." })),
-			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels); evaluates in the panel context instead of a tab." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -1910,15 +1790,13 @@ Usage rules:
 		name: "chrome_screenshot",
 		label: "Chrome Screenshot",
 		description:
-			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk, or of an open side panel when panelId/panelUrl is given. Chrome's extension screenshot API requires the target tab to be the active tab in its window. Runs in the background by default (the tab is briefly activated within its window for the capture, then the previous active tab is restored); pass background=false to focus Chrome so the user can watch.",
+			"Capture a screenshot of an existing Chrome tab via the companion extension and save it to disk. Runs in the background by default; pass background=false to focus Chrome so the user can watch.",
 		promptSnippet: "Capture Chrome screenshots and save them under .pi/chrome-screenshots by default.",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "Output path. Defaults to .pi/chrome-screenshots/<timestamp>.<format>." })),
 			format: Type.Optional(StringEnum(imageFormatValues)),
 			quality: Type.Optional(Type.Number({ description: "JPEG quality 0-100." })),
 			fullPage: Type.Optional(Type.Boolean({ description: "Not supported by the extension bridge yet; viewport screenshots are captured." })),
-			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); captures the panel instead of a tab." })),
-			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels); captures the panel instead of a tab." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -1971,13 +1849,11 @@ Usage rules:
 		name: "chrome_cdp",
 		label: "Chrome CDP",
 		description:
-			"Send a raw Chrome DevTools Protocol command to an existing Chrome tab (or an open side panel when panelId/panelUrl is given) and return the raw response. Escape hatch for capabilities the higher-level tools don't cover — e.g. Page.getLayoutMetrics, DOM.enable, Network.enable. Advanced; prefer the dedicated tools when they fit.",
+			"Send a raw Chrome DevTools Protocol command to an existing Chrome tab and return the raw response. Escape hatch for capabilities the higher-level tools don't cover — e.g. Page.getLayoutMetrics, DOM.enable, Network.enable. Advanced; prefer the dedicated tools when they fit.",
 		promptSnippet: "Send a raw CDP command to a Chrome tab.",
 		parameters: Type.Object({
 			method: Type.String({ description: "CDP method, e.g. Page.getLayoutMetrics, DOM.enable, Network.enable." }),
 			params: Type.Optional(Type.Any({ description: "CDP method params (object)." })),
-			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); sends the command in the panel context instead of a tab." })),
-			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels)." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -2003,8 +1879,6 @@ Usage rules:
 			landscape: Type.Optional(Type.Boolean()),
 			scale: Type.Optional(Type.Number({ description: "Scale 0.1-2.0 (default 1)." })),
 			printBackground: Type.Optional(Type.Boolean({ default: true })),
-			panelId: Type.Optional(Type.String({ description: "CDP target id of an open side panel (see chrome_panels); renders the panel instead of a tab." })),
-			panelUrl: Type.Optional(Type.String({ description: "URL substring matching an open side panel (see chrome_panels)." })),
 			targetId: Type.Optional(Type.String()),
 			urlIncludes: Type.Optional(Type.String()),
 			titleIncludes: Type.Optional(Type.String()),
@@ -2021,12 +1895,11 @@ Usage rules:
 			const result = (await authorizedBridgeSend("page.pdf", withBackground(params), DEFAULT_TIMEOUT_MS, signal)) as {
 				dataBase64?: string;
 				tab?: unknown;
-				panel?: unknown;
 			};
 			if (!result?.dataBase64) throw new Error("PDF render returned no data");
 			await mkdir(dirname(outputPath), { recursive: true });
 			await writeFile(outputPath, Buffer.from(result.dataBase64, "base64"));
-			return { content: [{ type: "text", text: `Saved PDF to ${outputPath}` }], details: { path: outputPath, tab: result.tab, panel: result.panel } };
+			return { content: [{ type: "text", text: `Saved PDF to ${outputPath}` }], details: { path: outputPath, tab: result.tab } };
 		},
 	});
 

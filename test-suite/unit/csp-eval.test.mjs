@@ -185,6 +185,26 @@ async function run() {
   const ent = cdpKeyInfo("Enter");
   ok(ent.code === "Enter" && ent.windowsVirtualKeyCode === 13, "cdpKeyInfo: named key 'Enter' unaffected");
 
+  // ===== chrome_key: Shift + printable character inserts shifted text =====
+  // Regression: modifier chords always used rawKeyDown with empty text, so Shift+a emitted
+  // trusted key events but left the focused input empty and reported key="a" instead of "A".
+  const keyEvents = [];
+  sandbox.getTabByParams = async () => ({ id: 1, windowId: 1 });
+  sandbox.attachDebugger = async () => ({});
+  sandbox.cdp = async (_tabId, method, params) => {
+    if (method === "Input.dispatchKeyEvent") keyEvents.push(params);
+    return {};
+  };
+  await sandbox.chromeInputKey({ targetId: 1, key: "a", modifiers: { shiftKey: true } });
+  const shiftedDown = keyEvents.find((event) => event.code === "KeyA" && event.type === "keyDown");
+  ok(shiftedDown?.key === "A" && shiftedDown?.text === "A", "chrome_key: Shift+a sends printable A text");
+  ok(keyEvents[0]?.key === "Shift" && keyEvents.at(-1)?.key === "Shift", "chrome_key: Shift wraps the printable key event");
+
+  keyEvents.length = 0;
+  await sandbox.chromeInputKey({ targetId: 1, key: "v", modifiers: { metaKey: true } });
+  const shortcutDown = keyEvents.find((event) => event.code === "KeyV" && event.type === "rawKeyDown");
+  ok(shortcutDown?.text === "", "chrome_key: Meta+V remains a non-text shortcut");
+
   console.log(`\n${passes} passed, ${failures} failed`);
   if (failures) process.exit(1);
 }

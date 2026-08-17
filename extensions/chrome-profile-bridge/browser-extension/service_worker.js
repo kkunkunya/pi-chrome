@@ -27,8 +27,12 @@ let polling = false;
 // storage.session is cleared on browser restart; any window restored by Chrome's session-restore
 // is then untracked and simply left alone (we only ever close ids we still recognize as ours).
 const automationTargets = new Map(); // sessionKey -> { windowId?: number, tabId: number }
+// Tabs created by tab.new are safe to close at session end. Existing user tabs Pi merely adopts
+// into its group are preserved and only ungrouped if they are still in that exact group.
+const sessionResources = new Map(); // sessionKey -> { createdTabIds: Set<number>, adoptedTabs: Map<tabId, groupId> }
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
+const SESSION_RESOURCES_STORAGE_KEY = "piChromeSessionResources";
 let automationHydrated = false;
 
 function sessionKeyOf(params) {
@@ -56,6 +60,16 @@ async function hydrateAutomationTargets() {
         }
       }
     }
+    const storedResources = await chrome.storage?.session?.get?.(SESSION_RESOURCES_STORAGE_KEY);
+    const savedResources = storedResources && storedResources[SESSION_RESOURCES_STORAGE_KEY];
+    if (savedResources && typeof savedResources === "object") {
+      for (const [key, value] of Object.entries(savedResources)) {
+        if (!value || typeof value !== "object") continue;
+        const createdTabIds = new Set(Array.isArray(value.createdTabIds) ? value.createdTabIds.filter((id) => typeof id === "number") : []);
+        const adoptedTabs = new Map(Array.isArray(value.adoptedTabs) ? value.adoptedTabs.filter((pair) => Array.isArray(pair) && typeof pair[0] === "number" && typeof pair[1] === "number") : []);
+        if (createdTabIds.size || adoptedTabs.size) sessionResources.set(key, { createdTabIds, adoptedTabs });
+      }
+    }
   } catch {
     // Ignore: treat as "no persisted state".
   }
@@ -71,6 +85,43 @@ async function persistAutomationTargets() {
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
+}
+
+async function persistSessionResources() {
+  try {
+    const obj = {};
+    for (const [key, value] of sessionResources) {
+      obj[key] = { createdTabIds: [...value.createdTabIds], adoptedTabs: [...value.adoptedTabs] };
+    }
+    await chrome.storage?.session?.set?.({ [SESSION_RESOURCES_STORAGE_KEY]: obj });
+  } catch {
+    // Ignore: persistence is an optimization, not a correctness requirement.
+  }
+}
+
+function resourcesFor(sessionKey) {
+  let resources = sessionResources.get(sessionKey);
+  if (!resources) {
+    resources = { createdTabIds: new Set(), adoptedTabs: new Map() };
+    sessionResources.set(sessionKey, resources);
+  }
+  return resources;
+}
+
+async function trackCreatedTab(sessionKey, tabId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).createdTabIds.add(tabId);
+  await persistSessionResources();
+}
+
+function isSessionCreatedTab(sessionKey, tabId) {
+  return sessionResources.get(sessionKey)?.createdTabIds.has(tabId) === true;
+}
+
+async function trackAdoptedTab(sessionKey, tabId, groupId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).adoptedTabs.set(tabId, groupId);
+  await persistSessionResources();
 }
 
 // True if `tabId` is a pi-chrome-owned automation tab. Pass `sessionKey` to check a specific
@@ -163,6 +214,30 @@ async function cleanupAutomationTarget(sessionKey) {
     }
   }
   return { closedWindowId: null, closedTabId: null };
+}
+
+async function cleanupSessionResources(sessionKey) {
+  await hydrateAutomationTargets();
+  const resources = sessionResources.get(sessionKey);
+  sessionResources.delete(sessionKey);
+  await persistSessionResources();
+
+  const automation = await cleanupAutomationTarget(sessionKey);
+  let closedCreatedTabs = 0;
+  let ungroupedAdoptedTabs = 0;
+  for (const tabId of resources?.createdTabIds || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) continue;
+    await chrome.tabs.remove(tabId).catch(() => {});
+    closedCreatedTabs++;
+  }
+  for (const [tabId, groupId] of resources?.adoptedTabs || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.groupId !== groupId) continue;
+    await chrome.tabs.ungroup(tabId).catch(() => {});
+    ungroupedAdoptedTabs++;
+  }
+  return { ...automation, closedCreatedTabs, ungroupedAdoptedTabs };
 }
 
 function withTimeout(promise, ms, label, onTimeout) {
@@ -337,135 +412,6 @@ async function detachAll() {
   await Promise.all(ids.map(detachDebugger));
 }
 
-// =================== Side panel (non-tab CDP target) support ===================
-// Extension side panels (chrome.sidePanel, e.g. AITDK) are NOT tabs: they are non-tab
-// CDP targets (type "other"/"page", no tabId) rendered next to a window. chrome.debugger
-// can attach to them via {targetId} when they are hosted at a plain http(s) URL
-// (e.g. https://extension.aitdk.com/). chrome-extension:// pages of other extensions
-// remain blocked by Chrome ("Cannot access a chrome-extension:// URL of different
-// extension"); those panels fall back to screenshot-only coverage via
-// chrome.tabs.captureVisibleTab (the visible window includes the panel).
-async function findPanelTarget(params) {
-  const panelId = params.panelId ? String(params.panelId) : "";
-  const panelUrl = params.panelUrl ? String(params.panelUrl) : "";
-  if (!panelId && !panelUrl) return null;
-  const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-  return targets.find((t) => {
-    if (t.tabId !== undefined && t.tabId !== null) return false;
-    const url = String(t.url || "");
-    if (!/^https?:/i.test(url)) return false;
-    if (panelId && t.id === panelId) return true;
-    if (panelUrl && url.includes(panelUrl)) return true;
-    return false;
-  }) || null;
-}
-
-async function attachPanel(target) {
-  const debuggee = { targetId: target.id };
-  await withTimeout(chrome.debugger.attach(debuggee, CDP_VERSION), ATTACH_TIMEOUT_MS, `attach debugger to panel ${target.url}`);
-  return debuggee;
-}
-
-async function probePanelTarget(target) {
-  const debuggee = { targetId: target.id };
-  try {
-    await attachPanel(target);
-    const res = await cdpEvalOn(debuggee, "({ title: document.title || '', topLevel: window.self === window.top, textLen: (document.body ? document.body.innerText : '').length, width: window.innerWidth, height: window.innerHeight })");
-    const out = {};
-    if (res.exceptionDetails) return out;
-    Object.assign(out, res && res.result ? res.result.value : {});
-    // Remote-hosted side panels (e.g. AITDK) render as OOPIF targets parented to the
-    // host tab; the panel the user currently sees is the one whose parent is the
-    // active tab. Record the parent so panel.list can rank instances.
-    try {
-      const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
-      if (ti && ti.targetInfo && ti.targetInfo.parentId) out.parentId = ti.targetInfo.parentId;
-    } catch {}
-    return out;
-  } catch (e) {
-    return { attachError: String(e.message || e).slice(0, 300) };
-  } finally {
-    try { await chrome.debugger.detach(debuggee); } catch {}
-  }
-}
-
-function panelReadTextExpression(params) {
-  const selector = String(params.textSelector || "body").trim();
-  if (!selector || selector.length > 500) throw new Error("panel.readText requires textSelector of 1-500 characters");
-  const maxTextChars = Math.max(1, Math.min(2_000_000, Number(params.maxTextChars) || 500_000));
-  return `(() => {
-    const root = document.querySelector(${JSON.stringify(selector)});
-    if (!root) return { ok: false, error: ${JSON.stringify(`No element matched textSelector ${selector}`)} };
-    const text = String(root.innerText ?? root.textContent ?? "");
-    return {
-      ok: true,
-      text: text.slice(0, ${maxTextChars}),
-      textLength: text.length,
-      truncated: text.length > ${maxTextChars},
-      title: document.title || "",
-      url: location.href,
-      readyState: document.readyState,
-    };
-  })()`;
-}
-
-function panelClickTextExpression(params) {
-  const label = String(params.label || "").replace(/\s+/g, " ").trim();
-  const selector = String(params.navigationSelector || 'button,[role="tab"],[role="button"],a').trim();
-  if (!label || label.length > 200) throw new Error("panel.clickText requires label of 1-200 characters");
-  if (!selector || selector.length > 500) throw new Error("panel.clickText requires navigationSelector of 1-500 characters");
-  return `(() => {
-    const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-    const wanted = ${JSON.stringify(label)};
-    const candidates = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
-    const labelOf = (el) => normalize(el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title"));
-    const visible = (el) => {
-      const style = getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-    };
-    const element = candidates.find((el) => labelOf(el) === wanted && visible(el));
-    if (!element) {
-      return {
-        ok: false,
-        error: "No visible navigation element matched " + JSON.stringify(wanted),
-        candidates: candidates.map(labelOf).filter(Boolean).slice(0, 30),
-      };
-    }
-    const rect = element.getBoundingClientRect();
-    const init = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      button: 0,
-      buttons: 1,
-    };
-    element.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-    element.dispatchEvent(new MouseEvent("mousedown", init));
-    element.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("click", { ...init, buttons: 0 }));
-    return {
-      ok: true,
-      label: labelOf(element),
-      tag: element.tagName,
-      ariaSelected: element.getAttribute("aria-selected"),
-      ariaCurrent: element.getAttribute("aria-current"),
-    };
-  })()`;
-}
-
-async function readPanelText(params) {
-  return evaluateInPanel({ ...params, expression: panelReadTextExpression(params) });
-}
-
-async function clickPanelText(params) {
-  return evaluateInPanel({ ...params, expression: panelClickTextExpression(params) });
-}
-
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
     if (tabId !== undefined) attachedTabs.delete(tabId);
@@ -575,7 +521,7 @@ async function cdp(tabId, method, params) {
     return await cdpRaw(tabId, method, params);
   } catch (error) {
     const msg = String(error?.message || error);
-    const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
+    const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id|CDP Input\.[^:]* timed out/i.test(msg);
     const isForeignExtBlock = /Cannot access a chrome-extension:\/\/ URL of different extension/i.test(msg);
     if (isForeignExtBlock && /Input\./.test(method)) {
       // Foreign chrome-extension popup (autofill, password manager) is hijacking input.
@@ -613,16 +559,6 @@ async function cdp(tabId, method, params) {
 async function cdpEval(tabId, expression, opts) {
   await attachDebugger(tabId);
   return cdp(tabId, "Runtime.evaluate", {
-    expression,
-    returnByValue: true,
-    awaitPromise: true,
-    userGesture: true,
-    ...(opts || {}),
-  });
-}
-
-function cdpEvalOn(debuggee, expression, opts) {
-  return cdpRawOn(debuggee, "Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
@@ -895,13 +831,16 @@ async function chromeInputKey(params) {
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: modBits });
     await sleep(rng(6, 18));
   }
-  const info = cdpKeyInfo(key);
-  // When modifiers are active, browsers usually emit "rawKeyDown" (no text) so chords like Cmd+V don't insert the literal char.
-  const downType = modBits ? "rawKeyDown" : "keyDown";
+  const shortcutModifier = Boolean(mods.metaKey || mods.ctrlKey || mods.altKey);
+  const shiftedKey = mods.shiftKey && key.length === 1 ? key.toUpperCase() : key;
+  const info = cdpKeyInfo(shiftedKey);
+  // Ctrl/Meta/Alt chords are shortcuts and must not insert literal text. Shift-only printable
+  // chords are text input (Shift+a => "A"), so keep keyDown + text for Chromium to edit the field.
+  const downType = shortcutModifier ? "rawKeyDown" : "keyDown";
   await cdp(tab.id, "Input.dispatchKeyEvent", {
     type: downType, key: info.key, code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, nativeVirtualKeyCode: info.windowsVirtualKeyCode,
-    text: modBits ? "" : info.text, unmodifiedText: modBits ? "" : info.text, modifiers: modBits,
+    text: shortcutModifier ? "" : info.text, unmodifiedText: shortcutModifier ? "" : info.text, modifiers: modBits,
   });
   await sleep(rng(25, 90));
   await cdp(tab.id, "Input.dispatchKeyEvent", {
@@ -1405,7 +1344,9 @@ async function dispatch(action, params) {
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       try {
-        return await groupTab(tab, groupTitle, params.groupColor);
+        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        await trackCreatedTab(sessionKeyOf(params), tab.id);
+        return grouped;
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
@@ -1433,72 +1374,6 @@ async function dispatch(action, params) {
       await chrome.tabs.remove(tab.id);
       return { closed: tab.id };
     }
-    case "panel.list": {
-      // Enumerate non-tab http(s) CDP targets (open side panels) and probe each for
-      // title / top-level-ness / text size / parent. attachError marks panels Chrome
-      // blocks (chrome-extension:// pages of other extensions).
-      // Panel heuristic: a remote-hosted side panel (e.g. AITDK at
-      // https://extension.aitdk.com/) is rendered by Chrome as an OOPIF target parented
-      // to a tab — window.self===window.top is then false, so topLevel alone would
-      // filter the real panel out. Accept topLevel targets OR content-rich ones
-      // (textLen > 300) that attach cleanly; bare third-party iframes (stripe, youtube
-      // embeds) stay filtered out. Side panels keep one instance per previously-visited
-      // tab; the one the user currently sees is parented to the active tab. Default
-      // behavior dedupes by URL; includeAllInstances exposes every instance with its
-      // host tab so callers can extract a whole Pi session without relying on focus.
-      const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-      const targetById = new Map(targets.map((target) => [target.id, target]));
-      const tabs = await chrome.tabs.query({}).catch(() => []);
-      const tabById = new Map(tabs.filter((tab) => typeof tab.id === "number").map((tab) => [tab.id, tab]));
-      const panels = [];
-      const seenByUrl = new Map();
-      const activeTab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
-      const activeTabTargetId = activeTab && typeof activeTab.id === "number"
-        ? (targets.find((t) => t.tabId === activeTab.id) || {}).id
-        : undefined;
-      let sessionGroupIds;
-      if (params.sessionOnly) {
-        const wanted = cleanGroupTitle(params.groupTitle || "Pi").toLowerCase();
-        const groups = await chrome.tabGroups.query({}).catch(() => []);
-        sessionGroupIds = new Set(groups.filter((group) => (group.title || "").trim().toLowerCase() === wanted).map((group) => group.id));
-      }
-      for (const t of targets) {
-        const url = String(t.url || "");
-        if (t.tabId !== undefined && t.tabId !== null) continue;
-        if (!/^https?:/i.test(url)) continue;
-        if (params.urlIncludes && !url.includes(String(params.urlIncludes))) continue;
-        const probe = await probePanelTarget(t);
-        if (!probe || probe.attachError) continue;
-        const parentTarget = probe.parentId ? targetById.get(probe.parentId) : null;
-        const hostTab = parentTarget && typeof parentTarget.tabId === "number" ? tabById.get(parentTarget.tabId) : null;
-        // Explicit all-instance discovery with a panel URL filter is stronger evidence
-        // than the text-size heuristic: a real panel can temporarily render <300 chars
-        // while loading. Keep the heuristic for broad/default listing so arbitrary
-        // content-rich page iframes do not flood chrome_panels.
-        const explicitHostedInstance = Boolean(params.includeAllInstances && params.urlIncludes && hostTab);
-        if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300) && !explicitHostedInstance) continue;
-        if (sessionGroupIds && (!hostTab || !sessionGroupIds.has(hostTab.groupId))) continue;
-        const entry = {
-          id: t.id,
-          type: t.type,
-          url,
-          current: Boolean(activeTabTargetId && probe.parentId === activeTabTargetId),
-          ...probe,
-          hostTab: hostTab ? await formatTab(hostTab) : null,
-        };
-        panels.push(entry);
-        if (params.includeAllInstances) continue;
-        const prev = seenByUrl.get(url);
-        if (prev?.current && !entry.current) continue;
-        if (prev && prev.current === entry.current && (prev.textLen || 0) >= (entry.textLen || 0)) continue;
-        seenByUrl.set(url, entry);
-      }
-      return params.includeAllInstances ? panels : Array.from(seenByUrl.values());
-    }
-    case "panel.readText":
-      return readPanelText(params);
-    case "panel.clickText":
-      return clickPanelText(params);
     case "page.snapshot":
       return snapshotInTab(params);
     case "page.inspect":
@@ -1577,7 +1452,7 @@ async function dispatch(action, params) {
     }
     case "page.cdp":
       // Raw CDP passthrough (WebBridge-style escape hatch): any chrome.debugger
-      // method/params on the target tab's session, or on a side panel debuggee.
+      // method/params on the target tab's session.
       return cdpPassthrough(params);
     case "page.pdf":
       return renderPdf(params);
@@ -1590,9 +1465,9 @@ async function dispatch(action, params) {
       return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
     }
     case "automation.cleanup":
-      // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
-      // another Pi session's target.
-      return cleanupAutomationTarget(sessionKeyOf(params));
+      // Close this session's owned automation target and tabs created by tab.new. Existing user
+      // tabs Pi adopted into the session group are preserved and only ungrouped.
+      return cleanupSessionResources(sessionKeyOf(params));
 
 
 
@@ -1682,18 +1557,22 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
   if (params.joinSessionGroup && params.sessionGroupTitle) {
-    await joinSessionGroup(tab, params.sessionGroupTitle);
+    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params));
   }
   return tab;
 }
 
 // Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
-// No-op when the tab is already grouped or tabGroups is unavailable.
-async function joinSessionGroup(tab, title) {
+// Existing user tabs are recorded as adopted so cleanup can ungroup — but never close — them.
+async function joinSessionGroup(tab, title, sessionKey) {
   if (!chrome.tabGroups || typeof tab.id !== "number") return;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
   try {
-    await groupTab(tab, title);
+    const grouped = await groupTab(tab, title);
+    const groupId = grouped?.group?.id;
+    if (typeof groupId === "number" && !isPiChromeOwnedTarget(tab.id, sessionKey) && !isSessionCreatedTab(sessionKey, tab.id)) {
+      await trackAdoptedTab(sessionKey, tab.id, groupId);
+    }
   } catch {
     // Grouping is best-effort; never block the actual page action on a grouping failure.
   }
@@ -1796,7 +1675,7 @@ function piEvalStringify(v) {
 // subject to the page's CSP, fixing `chrome_evaluate` silently returning null / failing on
 // pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
 // Shared chrome_evaluate body: runs the user expression through piEvalStringify via the
-// given evaluator (tab or panel debuggee), with the expression-form/statement-form fallback.
+// given evaluator, with the expression-form/statement-form fallback.
 async function runExpression(ev, expression) {
   const stringifySrc = `(${piEvalStringify.toString()})`;
   // Wrap the user expression so the result is run through piEvalStringify in-page before it
@@ -1829,26 +1708,9 @@ async function runExpression(ev, expression) {
 }
 
 async function evaluateInTab(params) {
-  if (params.panelId || params.panelUrl) return evaluateInPanel(params);
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   return runExpression((expression) => cdpEval(tab.id, expression), String(params.expression ?? ""));
-}
-
-async function evaluateInPanel(params) {
-  const target = await findPanelTarget(params);
-  if (!target) {
-    throw new Error(
-      `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-      "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-    );
-  }
-  const debuggee = await attachPanel(target);
-  try {
-    return await runExpression((expression) => cdpEvalOn(debuggee, expression), String(params.expression ?? ""));
-  } finally {
-    try { await chrome.debugger.detach(debuggee); } catch {}
-  }
 }
 
 async function withOptionalSnapshot(params, actionFn) {
@@ -1962,24 +1824,6 @@ async function unregisterInitScript(tabId) {
   await cdp(tabId, "Page.removeScriptToEvaluateOnNewDocument", { identifier }).catch(() => undefined);
 }
 
-// Always inject early console/network capture at document_start on every navigation.
-// Catches console messages, errors, and network requests that fire during page load,
-// before chrome_snapshot or chrome_evaluate install the instrumentation normally.
-// The function installEarlyCapture sets __piChromeWrapped flags so the post-hoc
-// installPiChromeInstrumentation() call is idempotent.
-if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
-  chrome.webNavigation.onCommitted.addListener((details) => {
-    if (details.frameId !== 0) return;
-    chrome.scripting.executeScript({
-      target: { tabId: details.tabId, frameIds: [0] },
-      world: "MAIN",
-      injectImmediately: true,
-      func: installEarlyCapture,
-      args: [],
-    }).catch(() => undefined);
-  });
-}
-
 async function bringToFront(tab) {
   await chrome.windows.update(tab.windowId, { focused: true });
   await chrome.tabs.update(tab.id, { active: true });
@@ -2004,7 +1848,7 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 // Raw CDP passthrough (chrome_cdp). Escape hatch for cases the higher-level tools
 // don't cover: any chrome.debugger method/params on the target tab's session, or on
-// a side panel debuggee when panelId/panelUrl is given. Method must be a CDP method
+// the target tab session. Method must be a CDP method
 // name; params is the raw method params object (optional).
 async function cdpPassthrough(params) {
   const method = params.method;
@@ -2012,49 +1856,19 @@ async function cdpPassthrough(params) {
     throw new Error(`page.cdp requires a CDP method like "Page.getLayoutMetrics" or "Runtime.evaluate", got ${JSON.stringify(method)}`);
   }
   const cdpParams = params.params && typeof params.params === "object" ? params.params : {};
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      return await cdpRawOn(debuggee, method, cdpParams);
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  return await cdpRaw(tab.id, method, cdpParams);
+  await attachDebugger(tab.id);
+  return await cdp(tab.id, method, cdpParams);
 }
 
 // Render the current page to PDF via CDP Page.printToPDF (chrome_pdf), like "Save
 // as PDF" in the print dialog. Returns base64 PDF data; the Pi side writes it to disk.
 async function renderPdf(params) {
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      const pdf = await cdpRawOn(debuggee, "Page.printToPDF", pdfParams(params));
-      if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
-      return { dataBase64: pdf.data, panel: { id: target.id, url: target.url, title: target.title || "" } };
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  const pdf = await cdpRaw(tab.id, "Page.printToPDF", pdfParams(params));
+  await attachDebugger(tab.id);
+  const pdf = await cdp(tab.id, "Page.printToPDF", pdfParams(params));
   if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
   return { dataBase64: pdf.data, tab: await formatTab(tab) };
 }
@@ -2071,61 +1885,6 @@ function pdfParams(params) {
 }
 
 async function takeScreenshot(params) {
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      const format = params.format || "png";
-      const captured = await cdpRawOn(debuggee, "Page.captureScreenshot", {
-        format,
-        quality: format === "jpeg" ? params.quality : undefined,
-      });
-      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
-      return { dataUrl: `data:image/${format};base64,${captured.data}`, panel: { id: target.id, url: target.url, title: target.title || "" } };
-    } catch (error) {
-      // Chrome 150+ renders remote-hosted side panels as OOPIF targets, where
-      // Page.captureScreenshot is rejected ("only on top-level targets"). Fall back
-      // to capturing the host tab: for a window with an open side panel the tab
-      // capture includes the panel region.
-      if (!/top-level targets/i.test(String(error?.message || error))) throw error;
-      let hostTabId;
-      try {
-        const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
-        const parentId = ti && ti.targetInfo && ti.targetInfo.parentId;
-        if (parentId) {
-          const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-          const parent = targets.find((t) => t.id === parentId);
-          if (parent && typeof parent.tabId === "number") hostTabId = parent.tabId;
-        }
-      } catch {}
-      if (typeof hostTabId !== "number") {
-        throw new Error(`Panel is an OOPIF side panel and its host tab could not be resolved: ${error?.message || error}`);
-      }
-      await chrome.debugger.detach(debuggee).catch(() => {});
-      const hostTab = await chrome.tabs.get(hostTabId).catch(() => null);
-      if (!hostTab) throw new Error(`Panel host tab ${hostTabId} is gone`);
-      if (params.foreground) await bringToFront(hostTab);
-      await attachDebugger(hostTabId);
-      const format = params.format || "png";
-      const captured = await cdp(hostTabId, "Page.captureScreenshot", {
-        format,
-        quality: format === "jpeg" ? params.quality : undefined,
-      });
-      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
-      return {
-        dataUrl: `data:image/${format};base64,${captured.data}`,
-        panel: { id: target.id, url: target.url, title: target.title || "", oopifHostTabId: hostTabId },
-      };
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
 
   // captureVisibleTab requires activating the target tab. In background mode that
@@ -2465,141 +2224,6 @@ function installPiChromeInstrumentation() {
       return originalSend.call(this, body);
     };
   }
-}
-
-// Early-capture version of installPiChromeInstrumentation, designed to be injected
-// at document_start via webNavigation.onCommitted. Wraps console, fetch, and XHR
-// before the page's own JavaScript runs, so page-load errors are captured.
-// Sets __piChromeWrapped flags so the post-hoc installPiChromeInstrumentation()
-// sees them and skips (idempotent).
-// NOTE: This function is self-contained — it does NOT close over any outer scope
-// because it gets serialized by chrome.scripting.executeScript({func: ...}).
-function installEarlyCapture() {
-  if (window.__piChromeEarlyCaptureInstalled) return;
-  window.__piChromeEarlyCaptureInstalled = true;
-  var state = window.__PI_CHROME_STATE__;
-  if (!state) {
-    state = {
-      nextElementUid: 1,
-      elements: {},
-      console: [],
-      network: [],
-      nextRequestId: 1,
-      instrumentationInstalled: false,
-    };
-    window.__PI_CHROME_STATE__ = state;
-  }
-  function pushConsole(level, args) {
-    state.console.push({
-      id: state.console.length + 1,
-      level: level,
-      timestamp: Date.now(),
-      url: location.href,
-      args: Array.from(args).map(function(arg) {
-        try {
-          if (typeof arg === "string") return arg;
-          if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
-        } catch (e) {
-          return String(arg);
-        }
-      }),
-    });
-    if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
-  }
-  for (var i = 0; i < 5; i++) {
-    var levels = ["debug", "log", "info", "warn", "error"];
-    var level = levels[i];
-    var original = console[level];
-    if (typeof original !== "function" || original.__piChromeWrapped) continue;
-    var wrapped = function(lvl, orig) {
-      return function() {
-        pushConsole(lvl, arguments);
-        return orig.apply(this, arguments);
-      };
-    }(level, original);
-    wrapped.__piChromeWrapped = true;
-    console[level] = wrapped;
-  }
-  window.addEventListener("error", function(event) {
-    pushConsole("pageerror", [event.message, event.filename + ":" + event.lineno + ":" + event.colno]);
-  });
-  window.addEventListener("unhandledrejection", function(event) {
-    pushConsole("unhandledrejection", [event.reason]);
-  });
-  var trimBody = function(text) {
-    return typeof text === "string" && text.length > 200000 ? text.slice(0, 200000) + "\n[truncated " + (text.length - 200000) + " chars]" : text;
-  };
-  var record = function(entry) {
-    state.network.push(entry);
-    if (state.network.length > 1000) state.network.splice(0, state.network.length - 1000);
-    return entry;
-  };
-  if (window.fetch && !window.fetch.__piChromeWrapped) {
-    var originalFetch = window.fetch.bind(window);
-    var wrappedFetch = async function() {
-      var args = [];
-      for (var k = 0; k < arguments.length; k++) args.push(arguments[k]);
-      var id = "req-" + state.nextRequestId++;
-      var startedAt = Date.now();
-      var input = args[0];
-      var init = args[1] || {};
-      var url = typeof input === "string" ? input : (input ? input.url : "");
-      var method = (init.method || (input ? input.method : null) || "GET").toUpperCase();
-      var entry = record({ id: id, type: "fetch", method: method, url: String(url || ""), startedAt: startedAt, pageUrl: location.href, status: "pending" });
-      try {
-        var response = await originalFetch.apply(window, args);
-        entry.status = response.status;
-        entry.statusText = response.statusText;
-        entry.ok = response.ok;
-        entry.responseUrl = response.url;
-        entry.durationMs = Date.now() - startedAt;
-        entry.responseHeaders = Array.from(response.headers.entries());
-        response.clone().text().then(function(text) {
-          entry.responseBody = trimBody(text);
-          entry.responseBodyTruncated = typeof text === "string" && text.length > 200000;
-        }).catch(function(error) { entry.responseBodyError = error ? error.message : String(error); });
-        return response;
-      } catch (error) {
-        entry.error = error ? error.message : String(error);
-        entry.durationMs = Date.now() - startedAt;
-        throw error;
-      }
-    };
-    wrappedFetch.__piChromeWrapped = true;
-    window.fetch = wrappedFetch;
-  }
-  if (window.XMLHttpRequest && !XMLHttpRequest.prototype.open.__piChromeWrapped) {
-    var originalOpen = XMLHttpRequest.prototype.open;
-    var originalSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this.__piChromeRequest = { method: String(method || "GET").toUpperCase(), url: String(url || "") };
-      return originalOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.open.__piChromeWrapped = true;
-    XMLHttpRequest.prototype.send = function(body) {
-      var id = "req-" + state.nextRequestId++;
-      var startedAt = Date.now();
-      var info = this.__piChromeRequest || {};
-      var entry = record({ id: id, type: "xhr", method: info.method || "GET", url: info.url || "", startedAt: startedAt, pageUrl: location.href, status: "pending" });
-      this.addEventListener("loadend", function() {
-        entry.status = this.status;
-        entry.statusText = this.statusText;
-        entry.responseUrl = this.responseURL;
-        entry.durationMs = Date.now() - startedAt;
-        try { entry.responseHeadersText = this.getAllResponseHeaders(); } catch (e) {}
-        try {
-          if (typeof this.responseText === "string") {
-            entry.responseBody = trimBody(this.responseText);
-            entry.responseBodyTruncated = this.responseText.length > 200000;
-          }
-        } catch (error) { entry.responseBodyError = error ? error.message : String(error); }
-      });
-      this.addEventListener("error", function() { entry.error = "XMLHttpRequest error"; entry.durationMs = Date.now() - startedAt; });
-      return originalSend.apply(this, arguments);
-    };
-  }
-  state.instrumentationInstalled = true;
 }
 
 function probePage() {
