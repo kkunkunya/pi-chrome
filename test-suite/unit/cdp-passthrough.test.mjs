@@ -48,7 +48,8 @@ const sandbox = {
 sandbox.globalThis = sandbox;
 sandbox.self = sandbox;
 vm.createContext(sandbox);
-vm.runInContext(src, sandbox);
+vm.runInContext(src + "\nglobalThis.__attachedTabs = attachedTabs;", sandbox);
+const realCdp = sandbox.cdp;
 
 // ---- shim the primitives the new handlers rely on ----
 const calls = [];
@@ -60,6 +61,9 @@ sandbox.cdpRaw = async (tabId, method, params) => {
   if (method === "Page.printToPDF") return { data: "SGVscw==" }; // base64 "Hels"
   return { ok: true, echoed: params };
 };
+sandbox.cdp = (...args) => sandbox.cdpRaw(...args);
+const attached = [];
+sandbox.attachDebugger = async (tabId) => { attached.push(tabId); return {}; };
 
 (async () => {
   // pdfParams: defaults + clamps
@@ -79,15 +83,31 @@ sandbox.cdpRaw = async (tabId, method, params) => {
   const out = await sandbox.cdpPassthrough({ method: "Page.getLayoutMetrics", params: { foo: 1 }, targetId: "7" });
   ok(out && out.ok === true && out.echoed && out.echoed.foo === 1, "cdpPassthrough returns raw CDP response");
   ok(calls.length === 1 && calls[0].method === "Page.getLayoutMetrics" && calls[0].params.foo === 1 && calls[0].tabId === 7, "cdpPassthrough forwards method/params/tabId");
+  ok(attached.length === 1 && attached[0] === 7, "cdpPassthrough attaches a cold tab before the first CDP command");
 
   // renderPdf: returns base64 data + formatted tab
   const pdf = await sandbox.renderPdf({ targetId: "7", landscape: true });
   ok(pdf && pdf.dataBase64 === "SGVscw==", "renderPdf returns base64 PDF data");
   ok(pdf.tab && pdf.tab.url === "https://example.com", "renderPdf returns formatted tab");
   ok(calls.length === 2 && calls[1].method === "Page.printToPDF" && calls[1].params.landscape === true, "renderPdf calls Page.printToPDF with landscape");
+  ok(attached.length === 2 && attached[1] === 7, "renderPdf attaches a cold tab before printToPDF");
+
+  // CDP timeout recovery: clear the cached session, reattach, and retry exactly once.
+  sandbox.__attachedTabs.set(7, { debuggee: { tabId: 7 }, detachAt: Date.now() + 1000 });
+  let attempts = 0;
+  attached.length = 0;
+  sandbox.cdpRaw = async () => {
+    attempts++;
+    if (attempts === 1) throw new Error("CDP Input.dispatchMouseEvent timed out after 5000ms");
+    return { recovered: true };
+  };
+  const recovered = await realCdp(7, "Input.dispatchMouseEvent", {});
+  ok(recovered?.recovered === true && attempts === 2, "cdp retries one timed-out input command");
+  ok(attached.length === 1 && attached[0] === 7, "cdp timeout recovery reattaches the tab");
 
   // renderPdf: error when no data
   sandbox.cdpRaw = async () => ({});
+  sandbox.cdp = (...args) => sandbox.cdpRaw(...args);
   await throwsWith(() => sandbox.renderPdf({}), /no data/, "renderPdf throws when CDP returns no data");
 
   console.log(`\ncdp-passthrough: ${passes} passed, ${failures} failed`);

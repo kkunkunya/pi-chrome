@@ -27,8 +27,12 @@ let polling = false;
 // storage.session is cleared on browser restart; any window restored by Chrome's session-restore
 // is then untracked and simply left alone (we only ever close ids we still recognize as ours).
 const automationTargets = new Map(); // sessionKey -> { windowId?: number, tabId: number }
+// Tabs created by tab.new are safe to close at session end. Existing user tabs Pi merely adopts
+// into its group are preserved and only ungrouped if they are still in that exact group.
+const sessionResources = new Map(); // sessionKey -> { createdTabIds: Set<number>, adoptedTabs: Map<tabId, groupId> }
 const DEFAULT_SESSION_KEY = "__default__";
 const AUTOMATION_STORAGE_KEY = "piChromeAutomationTargets";
+const SESSION_RESOURCES_STORAGE_KEY = "piChromeSessionResources";
 let automationHydrated = false;
 
 function sessionKeyOf(params) {
@@ -56,6 +60,16 @@ async function hydrateAutomationTargets() {
         }
       }
     }
+    const storedResources = await chrome.storage?.session?.get?.(SESSION_RESOURCES_STORAGE_KEY);
+    const savedResources = storedResources && storedResources[SESSION_RESOURCES_STORAGE_KEY];
+    if (savedResources && typeof savedResources === "object") {
+      for (const [key, value] of Object.entries(savedResources)) {
+        if (!value || typeof value !== "object") continue;
+        const createdTabIds = new Set(Array.isArray(value.createdTabIds) ? value.createdTabIds.filter((id) => typeof id === "number") : []);
+        const adoptedTabs = new Map(Array.isArray(value.adoptedTabs) ? value.adoptedTabs.filter((pair) => Array.isArray(pair) && typeof pair[0] === "number" && typeof pair[1] === "number") : []);
+        if (createdTabIds.size || adoptedTabs.size) sessionResources.set(key, { createdTabIds, adoptedTabs });
+      }
+    }
   } catch {
     // Ignore: treat as "no persisted state".
   }
@@ -71,6 +85,43 @@ async function persistAutomationTargets() {
   } catch {
     // Ignore: persistence is an optimization, not a correctness requirement.
   }
+}
+
+async function persistSessionResources() {
+  try {
+    const obj = {};
+    for (const [key, value] of sessionResources) {
+      obj[key] = { createdTabIds: [...value.createdTabIds], adoptedTabs: [...value.adoptedTabs] };
+    }
+    await chrome.storage?.session?.set?.({ [SESSION_RESOURCES_STORAGE_KEY]: obj });
+  } catch {
+    // Ignore: persistence is an optimization, not a correctness requirement.
+  }
+}
+
+function resourcesFor(sessionKey) {
+  let resources = sessionResources.get(sessionKey);
+  if (!resources) {
+    resources = { createdTabIds: new Set(), adoptedTabs: new Map() };
+    sessionResources.set(sessionKey, resources);
+  }
+  return resources;
+}
+
+async function trackCreatedTab(sessionKey, tabId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).createdTabIds.add(tabId);
+  await persistSessionResources();
+}
+
+function isSessionCreatedTab(sessionKey, tabId) {
+  return sessionResources.get(sessionKey)?.createdTabIds.has(tabId) === true;
+}
+
+async function trackAdoptedTab(sessionKey, tabId, groupId) {
+  await hydrateAutomationTargets();
+  resourcesFor(sessionKey).adoptedTabs.set(tabId, groupId);
+  await persistSessionResources();
 }
 
 // True if `tabId` is a pi-chrome-owned automation tab. Pass `sessionKey` to check a specific
@@ -163,6 +214,30 @@ async function cleanupAutomationTarget(sessionKey) {
     }
   }
   return { closedWindowId: null, closedTabId: null };
+}
+
+async function cleanupSessionResources(sessionKey) {
+  await hydrateAutomationTargets();
+  const resources = sessionResources.get(sessionKey);
+  sessionResources.delete(sessionKey);
+  await persistSessionResources();
+
+  const automation = await cleanupAutomationTarget(sessionKey);
+  let closedCreatedTabs = 0;
+  let ungroupedAdoptedTabs = 0;
+  for (const tabId of resources?.createdTabIds || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) continue;
+    await chrome.tabs.remove(tabId).catch(() => {});
+    closedCreatedTabs++;
+  }
+  for (const [tabId, groupId] of resources?.adoptedTabs || []) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.groupId !== groupId) continue;
+    await chrome.tabs.ungroup(tabId).catch(() => {});
+    ungroupedAdoptedTabs++;
+  }
+  return { ...automation, closedCreatedTabs, ungroupedAdoptedTabs };
 }
 
 function withTimeout(promise, ms, label, onTimeout) {
@@ -575,7 +650,7 @@ async function cdp(tabId, method, params) {
     return await cdpRaw(tabId, method, params);
   } catch (error) {
     const msg = String(error?.message || error);
-    const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id/i.test(msg);
+    const isStale = /Debugger is not attached|Detached while|Target closed|No tab with id|CDP Input\.[^:]* timed out/i.test(msg);
     const isForeignExtBlock = /Cannot access a chrome-extension:\/\/ URL of different extension/i.test(msg);
     if (isForeignExtBlock && /Input\./.test(method)) {
       // Foreign chrome-extension popup (autofill, password manager) is hijacking input.
@@ -895,13 +970,16 @@ async function chromeInputKey(params) {
     await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", key: m.key, code: m.code, windowsVirtualKeyCode: m.vk, modifiers: modBits });
     await sleep(rng(6, 18));
   }
-  const info = cdpKeyInfo(key);
-  // When modifiers are active, browsers usually emit "rawKeyDown" (no text) so chords like Cmd+V don't insert the literal char.
-  const downType = modBits ? "rawKeyDown" : "keyDown";
+  const shortcutModifier = Boolean(mods.metaKey || mods.ctrlKey || mods.altKey);
+  const shiftedKey = mods.shiftKey && key.length === 1 ? key.toUpperCase() : key;
+  const info = cdpKeyInfo(shiftedKey);
+  // Ctrl/Meta/Alt chords are shortcuts and must not insert literal text. Shift-only printable
+  // chords are text input (Shift+a => "A"), so keep keyDown + text for Chromium to edit the field.
+  const downType = shortcutModifier ? "rawKeyDown" : "keyDown";
   await cdp(tab.id, "Input.dispatchKeyEvent", {
     type: downType, key: info.key, code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode, nativeVirtualKeyCode: info.windowsVirtualKeyCode,
-    text: modBits ? "" : info.text, unmodifiedText: modBits ? "" : info.text, modifiers: modBits,
+    text: shortcutModifier ? "" : info.text, unmodifiedText: shortcutModifier ? "" : info.text, modifiers: modBits,
   });
   await sleep(rng(25, 90));
   await cdp(tab.id, "Input.dispatchKeyEvent", {
@@ -1405,7 +1483,9 @@ async function dispatch(action, params) {
       if (existingGroup && typeof existingGroup.windowId === "number") createParams.windowId = existingGroup.windowId;
       const tab = await chrome.tabs.create(createParams);
       try {
-        return await groupTab(tab, groupTitle, params.groupColor);
+        const grouped = await groupTab(tab, groupTitle, params.groupColor);
+        await trackCreatedTab(sessionKeyOf(params), tab.id);
+        return grouped;
       } catch (error) {
         if (typeof tab.id === "number") await chrome.tabs.remove(tab.id).catch(() => {});
         throw error;
@@ -1590,9 +1670,9 @@ async function dispatch(action, params) {
       return { windowId: t?.windowId ?? null, tabId: t?.tabId ?? null };
     }
     case "automation.cleanup":
-      // Close only THIS session's pi-chrome-owned window/tab. Never touches user tabs/windows or
-      // another Pi session's target.
-      return cleanupAutomationTarget(sessionKeyOf(params));
+      // Close this session's owned automation target and tabs created by tab.new. Existing user
+      // tabs Pi adopted into the session group are preserved and only ungrouped.
+      return cleanupSessionResources(sessionKeyOf(params));
 
 
 
@@ -1682,18 +1762,22 @@ async function getTabByParams(params, { createOwnedTarget = true } = {}) {
   // which tabs Pi is driving. We only adopt *ungrouped* tabs — never hijack a tab the user (or
   // another Pi session) already grouped, since groupTab would otherwise rename that group.
   if (params.joinSessionGroup && params.sessionGroupTitle) {
-    await joinSessionGroup(tab, params.sessionGroupTitle);
+    await joinSessionGroup(tab, params.sessionGroupTitle, sessionKeyOf(params));
   }
   return tab;
 }
 
 // Add an ungrouped tab to the session's tab group (reusing it by title, else creating it).
-// No-op when the tab is already grouped or tabGroups is unavailable.
-async function joinSessionGroup(tab, title) {
+// Existing user tabs are recorded as adopted so cleanup can ungroup — but never close — them.
+async function joinSessionGroup(tab, title, sessionKey) {
   if (!chrome.tabGroups || typeof tab.id !== "number") return;
   if (typeof tab.groupId === "number" && tab.groupId >= 0) return;
   try {
-    await groupTab(tab, title);
+    const grouped = await groupTab(tab, title);
+    const groupId = grouped?.group?.id;
+    if (typeof groupId === "number" && !isPiChromeOwnedTarget(tab.id, sessionKey) && !isSessionCreatedTab(sessionKey, tab.id)) {
+      await trackAdoptedTab(sessionKey, tab.id, groupId);
+    }
   } catch {
     // Grouping is best-effort; never block the actual page action on a grouping failure.
   }
@@ -1962,24 +2046,6 @@ async function unregisterInitScript(tabId) {
   await cdp(tabId, "Page.removeScriptToEvaluateOnNewDocument", { identifier }).catch(() => undefined);
 }
 
-// Always inject early console/network capture at document_start on every navigation.
-// Catches console messages, errors, and network requests that fire during page load,
-// before chrome_snapshot or chrome_evaluate install the instrumentation normally.
-// The function installEarlyCapture sets __piChromeWrapped flags so the post-hoc
-// installPiChromeInstrumentation() call is idempotent.
-if (chrome.webNavigation && chrome.webNavigation.onCommitted) {
-  chrome.webNavigation.onCommitted.addListener((details) => {
-    if (details.frameId !== 0) return;
-    chrome.scripting.executeScript({
-      target: { tabId: details.tabId, frameIds: [0] },
-      world: "MAIN",
-      injectImmediately: true,
-      func: installEarlyCapture,
-      args: [],
-    }).catch(() => undefined);
-  });
-}
-
 async function bringToFront(tab) {
   await chrome.windows.update(tab.windowId, { focused: true });
   await chrome.tabs.update(tab.id, { active: true });
@@ -2029,7 +2095,8 @@ async function cdpPassthrough(params) {
   }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  return await cdpRaw(tab.id, method, cdpParams);
+  await attachDebugger(tab.id);
+  return await cdp(tab.id, method, cdpParams);
 }
 
 // Render the current page to PDF via CDP Page.printToPDF (chrome_pdf), like "Save
@@ -2054,7 +2121,8 @@ async function renderPdf(params) {
   }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
-  const pdf = await cdpRaw(tab.id, "Page.printToPDF", pdfParams(params));
+  await attachDebugger(tab.id);
+  const pdf = await cdp(tab.id, "Page.printToPDF", pdfParams(params));
   if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
   return { dataBase64: pdf.data, tab: await formatTab(tab) };
 }
@@ -2465,141 +2533,6 @@ function installPiChromeInstrumentation() {
       return originalSend.call(this, body);
     };
   }
-}
-
-// Early-capture version of installPiChromeInstrumentation, designed to be injected
-// at document_start via webNavigation.onCommitted. Wraps console, fetch, and XHR
-// before the page's own JavaScript runs, so page-load errors are captured.
-// Sets __piChromeWrapped flags so the post-hoc installPiChromeInstrumentation()
-// sees them and skips (idempotent).
-// NOTE: This function is self-contained — it does NOT close over any outer scope
-// because it gets serialized by chrome.scripting.executeScript({func: ...}).
-function installEarlyCapture() {
-  if (window.__piChromeEarlyCaptureInstalled) return;
-  window.__piChromeEarlyCaptureInstalled = true;
-  var state = window.__PI_CHROME_STATE__;
-  if (!state) {
-    state = {
-      nextElementUid: 1,
-      elements: {},
-      console: [],
-      network: [],
-      nextRequestId: 1,
-      instrumentationInstalled: false,
-    };
-    window.__PI_CHROME_STATE__ = state;
-  }
-  function pushConsole(level, args) {
-    state.console.push({
-      id: state.console.length + 1,
-      level: level,
-      timestamp: Date.now(),
-      url: location.href,
-      args: Array.from(args).map(function(arg) {
-        try {
-          if (typeof arg === "string") return arg;
-          if (arg instanceof Error) return { name: arg.name, message: arg.message, stack: arg.stack };
-          return JSON.parse(JSON.stringify(arg));
-        } catch (e) {
-          return String(arg);
-        }
-      }),
-    });
-    if (state.console.length > 500) state.console.splice(0, state.console.length - 500);
-  }
-  for (var i = 0; i < 5; i++) {
-    var levels = ["debug", "log", "info", "warn", "error"];
-    var level = levels[i];
-    var original = console[level];
-    if (typeof original !== "function" || original.__piChromeWrapped) continue;
-    var wrapped = function(lvl, orig) {
-      return function() {
-        pushConsole(lvl, arguments);
-        return orig.apply(this, arguments);
-      };
-    }(level, original);
-    wrapped.__piChromeWrapped = true;
-    console[level] = wrapped;
-  }
-  window.addEventListener("error", function(event) {
-    pushConsole("pageerror", [event.message, event.filename + ":" + event.lineno + ":" + event.colno]);
-  });
-  window.addEventListener("unhandledrejection", function(event) {
-    pushConsole("unhandledrejection", [event.reason]);
-  });
-  var trimBody = function(text) {
-    return typeof text === "string" && text.length > 200000 ? text.slice(0, 200000) + "\n[truncated " + (text.length - 200000) + " chars]" : text;
-  };
-  var record = function(entry) {
-    state.network.push(entry);
-    if (state.network.length > 1000) state.network.splice(0, state.network.length - 1000);
-    return entry;
-  };
-  if (window.fetch && !window.fetch.__piChromeWrapped) {
-    var originalFetch = window.fetch.bind(window);
-    var wrappedFetch = async function() {
-      var args = [];
-      for (var k = 0; k < arguments.length; k++) args.push(arguments[k]);
-      var id = "req-" + state.nextRequestId++;
-      var startedAt = Date.now();
-      var input = args[0];
-      var init = args[1] || {};
-      var url = typeof input === "string" ? input : (input ? input.url : "");
-      var method = (init.method || (input ? input.method : null) || "GET").toUpperCase();
-      var entry = record({ id: id, type: "fetch", method: method, url: String(url || ""), startedAt: startedAt, pageUrl: location.href, status: "pending" });
-      try {
-        var response = await originalFetch.apply(window, args);
-        entry.status = response.status;
-        entry.statusText = response.statusText;
-        entry.ok = response.ok;
-        entry.responseUrl = response.url;
-        entry.durationMs = Date.now() - startedAt;
-        entry.responseHeaders = Array.from(response.headers.entries());
-        response.clone().text().then(function(text) {
-          entry.responseBody = trimBody(text);
-          entry.responseBodyTruncated = typeof text === "string" && text.length > 200000;
-        }).catch(function(error) { entry.responseBodyError = error ? error.message : String(error); });
-        return response;
-      } catch (error) {
-        entry.error = error ? error.message : String(error);
-        entry.durationMs = Date.now() - startedAt;
-        throw error;
-      }
-    };
-    wrappedFetch.__piChromeWrapped = true;
-    window.fetch = wrappedFetch;
-  }
-  if (window.XMLHttpRequest && !XMLHttpRequest.prototype.open.__piChromeWrapped) {
-    var originalOpen = XMLHttpRequest.prototype.open;
-    var originalSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url) {
-      this.__piChromeRequest = { method: String(method || "GET").toUpperCase(), url: String(url || "") };
-      return originalOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.open.__piChromeWrapped = true;
-    XMLHttpRequest.prototype.send = function(body) {
-      var id = "req-" + state.nextRequestId++;
-      var startedAt = Date.now();
-      var info = this.__piChromeRequest || {};
-      var entry = record({ id: id, type: "xhr", method: info.method || "GET", url: info.url || "", startedAt: startedAt, pageUrl: location.href, status: "pending" });
-      this.addEventListener("loadend", function() {
-        entry.status = this.status;
-        entry.statusText = this.statusText;
-        entry.responseUrl = this.responseURL;
-        entry.durationMs = Date.now() - startedAt;
-        try { entry.responseHeadersText = this.getAllResponseHeaders(); } catch (e) {}
-        try {
-          if (typeof this.responseText === "string") {
-            entry.responseBody = trimBody(this.responseText);
-            entry.responseBodyTruncated = this.responseText.length > 200000;
-          }
-        } catch (error) { entry.responseBodyError = error ? error.message : String(error); }
-      });
-      this.addEventListener("error", function() { entry.error = "XMLHttpRequest error"; entry.durationMs = Date.now() - startedAt; });
-      return originalSend.apply(this, arguments);
-    };
-  }
-  state.instrumentationInstalled = true;
 }
 
 function probePage() {

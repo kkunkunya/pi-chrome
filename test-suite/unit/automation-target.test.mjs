@@ -9,6 +9,7 @@
 // Like csp-eval.test.mjs we load the *real* worker into a vm sandbox with a stateful chrome.*
 // mock, then exercise the real helpers and the real dispatch() paths. Chrome state (tabs/windows/
 // storage.session) can be shared across two sandbox loads to simulate a service-worker restart.
+// The Pi-side shutdown source is also checked because cleanup must be awaited before bridge.stop().
 
 import vm from "node:vm";
 import fs from "node:fs";
@@ -17,7 +18,9 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const workerPath = path.resolve(__dirname, "../../extensions/chrome-profile-bridge/browser-extension/service_worker.js");
+const indexPath = path.resolve(__dirname, "../../extensions/chrome-profile-bridge/index.ts");
 const src = fs.readFileSync(workerPath, "utf8");
+const indexSrc = fs.readFileSync(indexPath, "utf8");
 
 let failures = 0;
 let passes = 0;
@@ -151,6 +154,9 @@ function loadWorker(chrome) {
 const SK = "session:alpha"; // a representative sessionKey
 
 async function run() {
+  ok(/pi\.on\("session_shutdown", async \(event\)/.test(indexSrc), "shutdown: handler is async so cleanup can finish before bridge stop");
+  ok(/await cleanupAutomationTargetBestEffort\(2_000\);[\s\S]{0,400}const wasServer = bridge\.status\(\)\.mode === "server";[\s\S]{0,120}bridge\.stop\(\)/.test(indexSrc), "shutdown: bounded cleanup is awaited before bridge.stop and preserves wasServer guard");
+
   // ===== Isolation: navigation does not touch the user's active/other tabs. =====
   {
     const state = makeChromeState();
@@ -240,6 +246,48 @@ async function run() {
     ok(state.groups.size === groupsBefore + 1, "automation-target-group: reused the existing session group, only blank-title Pi group was extra");
     ok(nav2.groupId === groupId, "automation-target-group: new automation target joined the existing session group");
     ok(nav2.windowId === nav.windowId, "automation-target-group: new automation target was created in the existing group's window");
+  }
+
+  // ===== Full session cleanup closes Pi-created tabs and preserves adopted user tabs. =====
+  {
+    const state = makeChromeState();
+    const w = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const groupTitle = "Pi Session: alpha";
+
+    await w.dispatch("page.navigate", {
+      url: "https://mail.google.com/inbox", targetId: String(state.userGmail.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    const adoptedGroupId = state.tabs.get(state.userGmail.id).groupId;
+    ok(adoptedGroupId >= 0, "session-cleanup: existing user tab was adopted into the session group");
+
+    const opened = await w.dispatch("tab.new", { url: "https://pi.test/created", groupTitle, sessionKey: SK });
+    const cleanup = await w.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(opened.tab.id), "session-cleanup: closes tab.new tab");
+    ok(cleanup.closedCreatedTabs === 1, "session-cleanup: reports separately closed created tab");
+    ok(state.tabs.has(state.userGmail.id), "session-cleanup: preserves adopted user tab");
+    ok(state.tabs.get(state.userGmail.id).groupId === -1, "session-cleanup: ungroups adopted user tab");
+    ok(cleanup.ungroupedAdoptedTabs === 1, "session-cleanup: reports ungrouped adopted tab");
+    ok(state.windows.has(state.userWindowId), "session-cleanup: preserves user window");
+  }
+
+  // ===== Session resources survive a service-worker restart. =====
+  {
+    const state = makeChromeState();
+    const groupTitle = "Pi Session: alpha";
+    const w1 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    const opened = await w1.dispatch("tab.new", { url: "https://pi.test/persist-created", groupTitle, sessionKey: SK });
+    await w1.dispatch("page.navigate", {
+      url: "https://example.com/adopted", targetId: String(state.userArticle.id), waitUntilLoad: false,
+      sessionKey: SK, joinSessionGroup: true, sessionGroupTitle: groupTitle,
+    });
+    ok(typeof state.storage.piChromeSessionResources === "object", "resource-restart: persisted session resources");
+
+    const w2 = loadWorker(makeChrome(state, { withTabGroups: true }));
+    await w2.dispatch("automation.cleanup", { sessionKey: SK });
+    ok(!state.tabs.has(opened.tab.id), "resource-restart: closes persisted created tab after restart");
+    ok(state.tabs.has(state.userArticle.id) && state.tabs.get(state.userArticle.id).groupId === -1, "resource-restart: preserves and ungroups adopted user tab");
+    ok(!(SK in (state.storage.piChromeSessionResources || {})), "resource-restart: clears persisted resources");
   }
 
   // ===== tab.new never leaves an ungrouped tab behind when grouping fails. =====
@@ -399,6 +447,22 @@ async function run() {
     ok(calls.cdp.includes("Page.captureScreenshot"), "background screenshot: captures through CDP");
     ok(calls.tabUpdates.length === 0, "background screenshot: does not activate or restore any tab");
     ok(calls.windowUpdates.length === 0, "background screenshot: does not focus any window");
+  }
+
+  // ===== DOM fallback stays explicit when Chrome input fails. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state);
+    chrome.debugger.sendCommand = (_debuggee, method, _params, callback) => {
+      chrome.runtime.lastError = { message: `${method} failed` };
+      callback(undefined);
+      chrome.runtime.lastError = null;
+    };
+    chrome.scripting.executeScript = async () => [{ result: { tag: "BUTTON" } }];
+    const w = loadWorker(chrome);
+    const result = await w.dispatch("page.click", { targetId: String(state.userGmail.id), selector: "#go", sessionKey: SK });
+    ok(result.input === "dom-fallback", "click fallback: structured result exposes dom-fallback");
+    ok(typeof result.reason === "string" && result.reason.length > 0, "click fallback: includes the Chrome input failure reason");
   }
 
   // ===== Robust cleanup: no-op when nothing created, and when target already closed manually. =====

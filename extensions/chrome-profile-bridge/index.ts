@@ -247,6 +247,7 @@ function summarizeActionResult(result: unknown): string | undefined {
 	if (!result || typeof result !== "object") return undefined;
 	const r = result as Record<string, unknown>;
 	const parts: string[] = [];
+	if (r.input === "dom-fallback") parts.push("WARNING: synthetic DOM fallback (isTrusted=false)");
 	// NOTE: pageMutated is a coarse heuristic (a hash over body text + input values + node count).
 	// Many real effects — class/aria/data-state toggles, JS-held state, canvas, async updates —
 	// don't move it, so a false value is NOT proof the action did nothing. Surface it only as a
@@ -809,13 +810,11 @@ export default function (pi: ExtensionAPI): void {
 		}, { triggerTurn: false });
 	};
 
-	// Close THIS session's dedicated automation window/tab. Fire-and-forget and best-effort: it
-	// must never block /quit, /reload, revoke, or session end, and the service-worker side only
-	// ever closes targets this session created itself (never user tabs/windows, never another
-	// session's target). Errors (bridge down, target already closed) are intentionally swallowed.
-	const cleanupAutomationTargetBestEffort = (): void => {
+	// Close browser resources owned by THIS session. Revoke remains fire-and-forget, while real
+	// session shutdown awaits a bounded request before stopping the bridge.
+	const cleanupAutomationTargetBestEffort = async (timeoutMs = 3_000): Promise<void> => {
 		const sessionKey = sessionKeyFor(sessionCtx);
-		void bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, 3_000).catch(() => undefined);
+		await bridge.send("automation.cleanup", sessionKey !== undefined ? { sessionKey } : {}, timeoutMs).catch(() => undefined);
 	};
 
 	const lockChromeControl = (logAction?: "revoked" | "expired"): void => {
@@ -827,8 +826,8 @@ export default function (pi: ExtensionAPI): void {
 		if (logAction && wasUsable) logChromeToolChange(logAction, { authorizedUntil: undefined });
 		chromeAuthorizedUntil = undefined;
 		persistAuth();
-		// Revoking control ends pi-chrome's automation for this session; tidy up the target we own.
-		cleanupAutomationTargetBestEffort();
+		// Revoking control ends pi-chrome's automation for this session; tidy up resources we own.
+		void cleanupAutomationTargetBestEffort();
 	};
 
 	const authSummary = (): string => {
@@ -975,17 +974,12 @@ export default function (pi: ExtensionAPI): void {
 		updateChromeStatus(ctx);
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", async (event) => {
 		clearAuthExpiryTimer();
 		clearCountdownInterval();
-		// Tidy up this session's dedicated automation window on real session end, but NOT on
-		// "reload": /reload tears down and re-evaluates this module while the *same* session
-		// (same sessionKey) continues, so we keep the window so it is reused, not churned. The
-		// call is fire-and-forget and runs before bridge.stop() so it never blocks shutdown.
-		// (Owner-session quit may not deliver in time since stop() closes the bridge server;
-		// that only ever leaves a clearly pi-chrome window for the user to close — never a user
-		// tab — and /chrome revoke remains the reliable, bridge-alive cleanup path.)
-		if (event?.reason !== "reload") cleanupAutomationTargetBestEffort();
+		// /reload continues the same session, so preserve its resources. On real shutdown, wait up
+		// to 2s for Chrome cleanup before bridge.stop() can discard the queued command.
+		if (event?.reason !== "reload") await cleanupAutomationTargetBestEffort(2_000);
 		// Capture server ownership BEFORE stop(): stop() resets mode to undefined,
 		// and only the server-owning session may clear the global singleton flag.
 		// Client-mode sessions (subagents reusing the owner's bridge via the
