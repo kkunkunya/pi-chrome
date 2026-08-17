@@ -412,135 +412,6 @@ async function detachAll() {
   await Promise.all(ids.map(detachDebugger));
 }
 
-// =================== Side panel (non-tab CDP target) support ===================
-// Extension side panels (chrome.sidePanel, e.g. AITDK) are NOT tabs: they are non-tab
-// CDP targets (type "other"/"page", no tabId) rendered next to a window. chrome.debugger
-// can attach to them via {targetId} when they are hosted at a plain http(s) URL
-// (e.g. https://extension.aitdk.com/). chrome-extension:// pages of other extensions
-// remain blocked by Chrome ("Cannot access a chrome-extension:// URL of different
-// extension"); those panels fall back to screenshot-only coverage via
-// chrome.tabs.captureVisibleTab (the visible window includes the panel).
-async function findPanelTarget(params) {
-  const panelId = params.panelId ? String(params.panelId) : "";
-  const panelUrl = params.panelUrl ? String(params.panelUrl) : "";
-  if (!panelId && !panelUrl) return null;
-  const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-  return targets.find((t) => {
-    if (t.tabId !== undefined && t.tabId !== null) return false;
-    const url = String(t.url || "");
-    if (!/^https?:/i.test(url)) return false;
-    if (panelId && t.id === panelId) return true;
-    if (panelUrl && url.includes(panelUrl)) return true;
-    return false;
-  }) || null;
-}
-
-async function attachPanel(target) {
-  const debuggee = { targetId: target.id };
-  await withTimeout(chrome.debugger.attach(debuggee, CDP_VERSION), ATTACH_TIMEOUT_MS, `attach debugger to panel ${target.url}`);
-  return debuggee;
-}
-
-async function probePanelTarget(target) {
-  const debuggee = { targetId: target.id };
-  try {
-    await attachPanel(target);
-    const res = await cdpEvalOn(debuggee, "({ title: document.title || '', topLevel: window.self === window.top, textLen: (document.body ? document.body.innerText : '').length, width: window.innerWidth, height: window.innerHeight })");
-    const out = {};
-    if (res.exceptionDetails) return out;
-    Object.assign(out, res && res.result ? res.result.value : {});
-    // Remote-hosted side panels (e.g. AITDK) render as OOPIF targets parented to the
-    // host tab; the panel the user currently sees is the one whose parent is the
-    // active tab. Record the parent so panel.list can rank instances.
-    try {
-      const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
-      if (ti && ti.targetInfo && ti.targetInfo.parentId) out.parentId = ti.targetInfo.parentId;
-    } catch {}
-    return out;
-  } catch (e) {
-    return { attachError: String(e.message || e).slice(0, 300) };
-  } finally {
-    try { await chrome.debugger.detach(debuggee); } catch {}
-  }
-}
-
-function panelReadTextExpression(params) {
-  const selector = String(params.textSelector || "body").trim();
-  if (!selector || selector.length > 500) throw new Error("panel.readText requires textSelector of 1-500 characters");
-  const maxTextChars = Math.max(1, Math.min(2_000_000, Number(params.maxTextChars) || 500_000));
-  return `(() => {
-    const root = document.querySelector(${JSON.stringify(selector)});
-    if (!root) return { ok: false, error: ${JSON.stringify(`No element matched textSelector ${selector}`)} };
-    const text = String(root.innerText ?? root.textContent ?? "");
-    return {
-      ok: true,
-      text: text.slice(0, ${maxTextChars}),
-      textLength: text.length,
-      truncated: text.length > ${maxTextChars},
-      title: document.title || "",
-      url: location.href,
-      readyState: document.readyState,
-    };
-  })()`;
-}
-
-function panelClickTextExpression(params) {
-  const label = String(params.label || "").replace(/\s+/g, " ").trim();
-  const selector = String(params.navigationSelector || 'button,[role="tab"],[role="button"],a').trim();
-  if (!label || label.length > 200) throw new Error("panel.clickText requires label of 1-200 characters");
-  if (!selector || selector.length > 500) throw new Error("panel.clickText requires navigationSelector of 1-500 characters");
-  return `(() => {
-    const normalize = (value) => String(value || "").replace(/\\s+/g, " ").trim();
-    const wanted = ${JSON.stringify(label)};
-    const candidates = Array.from(document.querySelectorAll(${JSON.stringify(selector)}));
-    const labelOf = (el) => normalize(el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title"));
-    const visible = (el) => {
-      const style = getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
-    };
-    const element = candidates.find((el) => labelOf(el) === wanted && visible(el));
-    if (!element) {
-      return {
-        ok: false,
-        error: "No visible navigation element matched " + JSON.stringify(wanted),
-        candidates: candidates.map(labelOf).filter(Boolean).slice(0, 30),
-      };
-    }
-    const rect = element.getBoundingClientRect();
-    const init = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      view: window,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      button: 0,
-      buttons: 1,
-    };
-    element.dispatchEvent(new PointerEvent("pointerdown", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true }));
-    element.dispatchEvent(new MouseEvent("mousedown", init));
-    element.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerId: 1, pointerType: "mouse", isPrimary: true, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mouseup", { ...init, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("click", { ...init, buttons: 0 }));
-    return {
-      ok: true,
-      label: labelOf(element),
-      tag: element.tagName,
-      ariaSelected: element.getAttribute("aria-selected"),
-      ariaCurrent: element.getAttribute("aria-current"),
-    };
-  })()`;
-}
-
-async function readPanelText(params) {
-  return evaluateInPanel({ ...params, expression: panelReadTextExpression(params) });
-}
-
-async function clickPanelText(params) {
-  return evaluateInPanel({ ...params, expression: panelClickTextExpression(params) });
-}
-
 if (chrome.debugger && chrome.debugger.onDetach) {
   chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
     if (tabId !== undefined) attachedTabs.delete(tabId);
@@ -688,16 +559,6 @@ async function cdp(tabId, method, params) {
 async function cdpEval(tabId, expression, opts) {
   await attachDebugger(tabId);
   return cdp(tabId, "Runtime.evaluate", {
-    expression,
-    returnByValue: true,
-    awaitPromise: true,
-    userGesture: true,
-    ...(opts || {}),
-  });
-}
-
-function cdpEvalOn(debuggee, expression, opts) {
-  return cdpRawOn(debuggee, "Runtime.evaluate", {
     expression,
     returnByValue: true,
     awaitPromise: true,
@@ -1513,72 +1374,6 @@ async function dispatch(action, params) {
       await chrome.tabs.remove(tab.id);
       return { closed: tab.id };
     }
-    case "panel.list": {
-      // Enumerate non-tab http(s) CDP targets (open side panels) and probe each for
-      // title / top-level-ness / text size / parent. attachError marks panels Chrome
-      // blocks (chrome-extension:// pages of other extensions).
-      // Panel heuristic: a remote-hosted side panel (e.g. AITDK at
-      // https://extension.aitdk.com/) is rendered by Chrome as an OOPIF target parented
-      // to a tab — window.self===window.top is then false, so topLevel alone would
-      // filter the real panel out. Accept topLevel targets OR content-rich ones
-      // (textLen > 300) that attach cleanly; bare third-party iframes (stripe, youtube
-      // embeds) stay filtered out. Side panels keep one instance per previously-visited
-      // tab; the one the user currently sees is parented to the active tab. Default
-      // behavior dedupes by URL; includeAllInstances exposes every instance with its
-      // host tab so callers can extract a whole Pi session without relying on focus.
-      const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-      const targetById = new Map(targets.map((target) => [target.id, target]));
-      const tabs = await chrome.tabs.query({}).catch(() => []);
-      const tabById = new Map(tabs.filter((tab) => typeof tab.id === "number").map((tab) => [tab.id, tab]));
-      const panels = [];
-      const seenByUrl = new Map();
-      const activeTab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0] || null;
-      const activeTabTargetId = activeTab && typeof activeTab.id === "number"
-        ? (targets.find((t) => t.tabId === activeTab.id) || {}).id
-        : undefined;
-      let sessionGroupIds;
-      if (params.sessionOnly) {
-        const wanted = cleanGroupTitle(params.groupTitle || "Pi").toLowerCase();
-        const groups = await chrome.tabGroups.query({}).catch(() => []);
-        sessionGroupIds = new Set(groups.filter((group) => (group.title || "").trim().toLowerCase() === wanted).map((group) => group.id));
-      }
-      for (const t of targets) {
-        const url = String(t.url || "");
-        if (t.tabId !== undefined && t.tabId !== null) continue;
-        if (!/^https?:/i.test(url)) continue;
-        if (params.urlIncludes && !url.includes(String(params.urlIncludes))) continue;
-        const probe = await probePanelTarget(t);
-        if (!probe || probe.attachError) continue;
-        const parentTarget = probe.parentId ? targetById.get(probe.parentId) : null;
-        const hostTab = parentTarget && typeof parentTarget.tabId === "number" ? tabById.get(parentTarget.tabId) : null;
-        // Explicit all-instance discovery with a panel URL filter is stronger evidence
-        // than the text-size heuristic: a real panel can temporarily render <300 chars
-        // while loading. Keep the heuristic for broad/default listing so arbitrary
-        // content-rich page iframes do not flood chrome_panels.
-        const explicitHostedInstance = Boolean(params.includeAllInstances && params.urlIncludes && hostTab);
-        if (probe.topLevel !== true && !(typeof probe.textLen === "number" && probe.textLen > 300) && !explicitHostedInstance) continue;
-        if (sessionGroupIds && (!hostTab || !sessionGroupIds.has(hostTab.groupId))) continue;
-        const entry = {
-          id: t.id,
-          type: t.type,
-          url,
-          current: Boolean(activeTabTargetId && probe.parentId === activeTabTargetId),
-          ...probe,
-          hostTab: hostTab ? await formatTab(hostTab) : null,
-        };
-        panels.push(entry);
-        if (params.includeAllInstances) continue;
-        const prev = seenByUrl.get(url);
-        if (prev?.current && !entry.current) continue;
-        if (prev && prev.current === entry.current && (prev.textLen || 0) >= (entry.textLen || 0)) continue;
-        seenByUrl.set(url, entry);
-      }
-      return params.includeAllInstances ? panels : Array.from(seenByUrl.values());
-    }
-    case "panel.readText":
-      return readPanelText(params);
-    case "panel.clickText":
-      return clickPanelText(params);
     case "page.snapshot":
       return snapshotInTab(params);
     case "page.inspect":
@@ -1657,7 +1452,7 @@ async function dispatch(action, params) {
     }
     case "page.cdp":
       // Raw CDP passthrough (WebBridge-style escape hatch): any chrome.debugger
-      // method/params on the target tab's session, or on a side panel debuggee.
+      // method/params on the target tab's session.
       return cdpPassthrough(params);
     case "page.pdf":
       return renderPdf(params);
@@ -1880,7 +1675,7 @@ function piEvalStringify(v) {
 // subject to the page's CSP, fixing `chrome_evaluate` silently returning null / failing on
 // pages that ship `script-src 'self'` without `'unsafe-eval'` (which blocks `eval`/`new Function`).
 // Shared chrome_evaluate body: runs the user expression through piEvalStringify via the
-// given evaluator (tab or panel debuggee), with the expression-form/statement-form fallback.
+// given evaluator, with the expression-form/statement-form fallback.
 async function runExpression(ev, expression) {
   const stringifySrc = `(${piEvalStringify.toString()})`;
   // Wrap the user expression so the result is run through piEvalStringify in-page before it
@@ -1913,26 +1708,9 @@ async function runExpression(ev, expression) {
 }
 
 async function evaluateInTab(params) {
-  if (params.panelId || params.panelUrl) return evaluateInPanel(params);
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   return runExpression((expression) => cdpEval(tab.id, expression), String(params.expression ?? ""));
-}
-
-async function evaluateInPanel(params) {
-  const target = await findPanelTarget(params);
-  if (!target) {
-    throw new Error(
-      `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-      "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-    );
-  }
-  const debuggee = await attachPanel(target);
-  try {
-    return await runExpression((expression) => cdpEvalOn(debuggee, expression), String(params.expression ?? ""));
-  } finally {
-    try { await chrome.debugger.detach(debuggee); } catch {}
-  }
 }
 
 async function withOptionalSnapshot(params, actionFn) {
@@ -2070,7 +1848,7 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 // Raw CDP passthrough (chrome_cdp). Escape hatch for cases the higher-level tools
 // don't cover: any chrome.debugger method/params on the target tab's session, or on
-// a side panel debuggee when panelId/panelUrl is given. Method must be a CDP method
+// the target tab session. Method must be a CDP method
 // name; params is the raw method params object (optional).
 async function cdpPassthrough(params) {
   const method = params.method;
@@ -2078,21 +1856,6 @@ async function cdpPassthrough(params) {
     throw new Error(`page.cdp requires a CDP method like "Page.getLayoutMetrics" or "Runtime.evaluate", got ${JSON.stringify(method)}`);
   }
   const cdpParams = params.params && typeof params.params === "object" ? params.params : {};
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      return await cdpRawOn(debuggee, method, cdpParams);
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -2102,23 +1865,6 @@ async function cdpPassthrough(params) {
 // Render the current page to PDF via CDP Page.printToPDF (chrome_pdf), like "Save
 // as PDF" in the print dialog. Returns base64 PDF data; the Pi side writes it to disk.
 async function renderPdf(params) {
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      const pdf = await cdpRawOn(debuggee, "Page.printToPDF", pdfParams(params));
-      if (!pdf?.data) throw new Error("Page.printToPDF returned no data");
-      return { dataBase64: pdf.data, panel: { id: target.id, url: target.url, title: target.title || "" } };
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
   if (params.foreground) await bringToFront(tab);
   await attachDebugger(tab.id);
@@ -2139,61 +1885,6 @@ function pdfParams(params) {
 }
 
 async function takeScreenshot(params) {
-  if (params.panelId || params.panelUrl) {
-    const target = await findPanelTarget(params);
-    if (!target) {
-      throw new Error(
-        `No open side panel matched ${params.panelId ? `panelId ${JSON.stringify(params.panelId)}` : `panelUrl ${JSON.stringify(params.panelUrl)}`}. ` +
-        "Use chrome_panels to list open side panels (only http(s)-hosted panels are attachable).",
-      );
-    }
-    const debuggee = await attachPanel(target);
-    try {
-      const format = params.format || "png";
-      const captured = await cdpRawOn(debuggee, "Page.captureScreenshot", {
-        format,
-        quality: format === "jpeg" ? params.quality : undefined,
-      });
-      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
-      return { dataUrl: `data:image/${format};base64,${captured.data}`, panel: { id: target.id, url: target.url, title: target.title || "" } };
-    } catch (error) {
-      // Chrome 150+ renders remote-hosted side panels as OOPIF targets, where
-      // Page.captureScreenshot is rejected ("only on top-level targets"). Fall back
-      // to capturing the host tab: for a window with an open side panel the tab
-      // capture includes the panel region.
-      if (!/top-level targets/i.test(String(error?.message || error))) throw error;
-      let hostTabId;
-      try {
-        const ti = await cdpRawOn(debuggee, "Target.getTargetInfo", { targetId: target.id });
-        const parentId = ti && ti.targetInfo && ti.targetInfo.parentId;
-        if (parentId) {
-          const targets = await new Promise((resolve) => chrome.debugger.getTargets((t) => resolve(t || []))).catch(() => []);
-          const parent = targets.find((t) => t.id === parentId);
-          if (parent && typeof parent.tabId === "number") hostTabId = parent.tabId;
-        }
-      } catch {}
-      if (typeof hostTabId !== "number") {
-        throw new Error(`Panel is an OOPIF side panel and its host tab could not be resolved: ${error?.message || error}`);
-      }
-      await chrome.debugger.detach(debuggee).catch(() => {});
-      const hostTab = await chrome.tabs.get(hostTabId).catch(() => null);
-      if (!hostTab) throw new Error(`Panel host tab ${hostTabId} is gone`);
-      if (params.foreground) await bringToFront(hostTab);
-      await attachDebugger(hostTabId);
-      const format = params.format || "png";
-      const captured = await cdp(hostTabId, "Page.captureScreenshot", {
-        format,
-        quality: format === "jpeg" ? params.quality : undefined,
-      });
-      if (!captured?.data) throw new Error("Page.captureScreenshot returned no image data");
-      return {
-        dataUrl: `data:image/${format};base64,${captured.data}`,
-        panel: { id: target.id, url: target.url, title: target.title || "", oopifHostTabId: hostTabId },
-      };
-    } finally {
-      try { await chrome.debugger.detach(debuggee); } catch {}
-    }
-  }
   const tab = await getTabByParams(params);
 
   // captureVisibleTab requires activating the target tab. In background mode that
