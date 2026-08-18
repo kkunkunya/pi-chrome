@@ -449,6 +449,34 @@ async function run() {
     ok(calls.windowUpdates.length === 0, "background screenshot: does not focus any window");
   }
 
+  // ===== Background input must not activate the target window/tab. =====
+  {
+    const state = makeChromeState();
+    const chrome = makeChrome(state);
+    const calls = { tabUpdates: [], windowUpdates: [], cdp: [] };
+    const originalTabUpdate = chrome.tabs.update;
+    chrome.tabs.update = async (id, props = {}) => {
+      calls.tabUpdates.push({ id, props });
+      return originalTabUpdate(id, props);
+    };
+    const originalWindowUpdate = chrome.windows.update;
+    chrome.windows.update = async (id, props = {}) => {
+      calls.windowUpdates.push({ id, props });
+      return originalWindowUpdate(id, props);
+    };
+    chrome.debugger.sendCommand = (_debuggee, method, _params, callback) => {
+      calls.cdp.push(method);
+      callback({});
+    };
+    chrome.scripting.executeScript = async () => [{ result: { tag: "BUTTON" } }];
+    const w = loadWorker(chrome);
+    const result = await w.dispatch("page.click", { targetId: String(state.userGmail.id), selector: "#go", foreground: false, sessionKey: SK });
+    ok(result.input === "dom-fallback", "background click: uses page-local fallback instead of focus-stealing CDP input");
+    ok(calls.tabUpdates.length === 0, "background click: does not activate the target tab");
+    ok(calls.windowUpdates.length === 0, "background click: does not focus the target window");
+    ok(calls.cdp.length === 0, "background click: does not send mouse events through CDP");
+  }
+
   // ===== DOM fallback stays explicit when Chrome input fails. =====
   {
     const state = makeChromeState();
