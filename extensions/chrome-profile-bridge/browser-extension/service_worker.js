@@ -767,7 +767,10 @@ async function domClickFallback(tabId, params, cause) {
 
 async function chromeInputClick(params) {
   const tab = await getTabByParams(params);
-  if (params.foreground) await bringToFront(tab);
+  // CDP mouse input can activate Chrome even without bringToFront. Background mode promises
+  // not to steal focus, so use the page-local fallback; trusted clicks require foreground mode.
+  if (!params.foreground) return domClickFallback(tab.id, params, new Error("background click preserves Chrome focus"));
+  await bringToFront(tab);
   try {
     await attachDebugger(tab.id);
     const resolved = await resolveTargetInTab(tab.id, params);
